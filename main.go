@@ -82,6 +82,10 @@ func main() {
 	//   tcp2socket connect tcp://127.0.0.1:8999
 	//   tcp2socket connect unix:///tmp/app.sock
 	if len(os.Args) >= 2 {
+		if os.Args[1] == "socks-stdio" {
+			runSocksStdioCLI(os.Args[2:])
+			return
+		}
 		if os.Args[1] == "connect" {
 			runConnectCLI(os.Args[2:])
 			return
@@ -125,6 +129,9 @@ Proxy mode:
 
 Connect mode:
   tcp2socket connect <target> [options]
+
+SOCKS5 over STDIO mode:
+  tcp2socket socks-stdio [options]
 
 nc-compatible shorthand:
   tcp2socket <target>
@@ -198,6 +205,46 @@ Options:
 	}
 
 	if err := runProxy(cfg); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runSocksStdioCLI(args []string) {
+	fs := flag.NewFlagSet("socks-stdio", flag.ExitOnError)
+
+	var (
+		dialTO  time.Duration
+		verbose bool
+	)
+
+	fs.DurationVar(&dialTO, "dial-timeout", 10*time.Second, "target dial timeout")
+	fs.BoolVar(&verbose, "v", false, "verbose logs to stderr")
+
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), `Usage:
+	  tcp2socket socks-stdio [options]
+
+	Serve one SOCKS5 connection over stdin/stdout.
+	Supports no authentication and the CONNECT command for TCP targets.
+
+	Example:
+	  ssh host 'exec tcp2socket socks-stdio'
+
+	Important:
+	  stdin/stdout are used as the raw SOCKS5 data channel.
+	  All logs are written to stderr.
+`)
+		fs.PrintDefaults()
+	}
+
+	_ = fs.Parse(args)
+
+	if fs.NArg() != 0 {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	if err := runSocksStdio(dialTO, verbose); err != nil {
 		log.Fatal(err)
 	}
 }

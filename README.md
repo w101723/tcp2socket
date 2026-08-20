@@ -8,6 +8,7 @@
 - Unix Socket -> Unix Socket
 - STDIO -> TCP
 - STDIO -> Unix Socket
+- SOCKS5 -> STDIO（无认证，仅支持 TCP CONNECT）
 
 其中 `connect` 模式可以直接替代很多 `nc host port` 场景，尤其适合 SSH 远端命令。
 
@@ -125,7 +126,40 @@ nc 127.0.0.1 8999
 
 ---
 
-## 3. SSH 场景
+## 3. SOCKS5 STDIO 模式
+
+`socks-stdio` 在 stdin/stdout 上直接提供一个 SOCKS5 服务，不需要预先启动 `127.0.0.1:8999` 等独立 SOCKS 服务。每次命令执行处理一个 SOCKS5 会话，适合 `ssh` 远程执行场景。
+
+当前仅支持：
+
+- SOCKS5
+- 无认证（`NO AUTHENTICATION REQUIRED`）
+- `CONNECT` 命令
+- IPv4、IPv6 和域名目标地址
+
+不支持 SOCKS4、用户名/密码认证和 UDP ASSOCIATE。
+
+```bash
+./tcp2socket socks-stdio
+```
+
+可选参数：
+
+```bash
+./tcp2socket socks-stdio -dial-timeout 10s -v
+```
+
+SSH 示例：
+
+```bash
+ssh -T host 'exec tcp2socket socks-stdio'
+```
+
+其中 stdout 是 SOCKS5 协议与业务数据通道；日志始终写到 stderr，不能在该模式下向 stdout 输出其他内容。
+
+---
+
+## 4. SSH 场景
 
 原命令：
 
@@ -148,4 +182,11 @@ ssh root@172.29.25.2 \
   'exec tcp2socket connect tcp://127.0.0.1:8999'
 ```
 
-注意：connect 模式中 stdout 是数据通道，因此 tcp2socket 的日志全部输出到 stderr，不会污染传输数据。
+或者直接使用内置 SOCKS5 服务：
+
+```bash
+ssh -T root@172.29.25.2 \
+  'exec tcp2socket socks-stdio'
+```
+
+注意：connect 和 socks-stdio 模式中 stdout 都是数据通道，因此 tcp2socket 的日志全部输出到 stderr，不会污染传输数据。
