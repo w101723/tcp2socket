@@ -63,16 +63,19 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Set release timestamp
+        run: echo "TAG=$(date -u +'%Y%m%d%H%M')" >> "$GITHUB_ENV"
+
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: commit-${{ github.sha }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
             gh release create "$TAG" dist/* \
               --title "$TAG" \
-              --notes "Automated build for commit $TAG."
+              --notes "Automated build for commit $COMMIT_SHA."
           fi

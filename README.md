@@ -18,7 +18,7 @@
 
 ### 从 Release 下载
 
-每次推送到 `main` 都会创建一个以 `commit-<完整 commit hash>` 标识的 Release，并提供：
+每次推送到 `main` 都会创建一个以 UTC 时间戳 `YYYYMMDDHHmm` 标识的 Release（例如 `202608201836`），并提供：
 
 | 平台 | 文件名 |
 | --- | --- |
