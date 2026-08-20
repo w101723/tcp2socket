@@ -35,7 +35,7 @@ go build -trimpath -ldflags="-s -w" -o tcp2socket .
 
 ## 自动发布
 
-每次代码推送到 `main` 分支时，GitHub Actions 会自动运行测试，并以完整 Git commit hash 创建或更新一个 GitHub Release。Release 中包含以下零 CGO 依赖的二进制文件：
+每次代码推送到 `main` 分支时，GitHub Actions 会自动运行测试，并以 `commit-<完整 Git commit hash>` 创建或更新一个 GitHub Release。Release 中包含以下零 CGO 依赖的二进制文件：
 
 - `tcp2socket-darwin-amd64`
 - `tcp2socket-darwin-arm64`
@@ -146,17 +146,6 @@ ssh root@172.29.25.2 \
 ```bash
 ssh root@172.29.25.2 \
   'exec tcp2socket connect tcp://127.0.0.1:8999'
-```
-
-完整示例：
-
-```bash
-socat \
-  TCP-LISTEN:8000,bind=0.0.0.0,reuseaddr,fork \
-  SYSTEM:"ssh -T \
-    -o 'ProxyCommand=ssh -i /Users/wangzq/data/evayinfo/code/env/ssh/dev -o IdentitiesOnly=yes -p 60022 -q sunrs@10.246.250.218 usm-ProxyCommand-nc --target %h:%p' \
-    root@172.29.25.2 \
-    'exec tcp2socket 127.0.0.1:8999'"
 ```
 
 注意：connect 模式中 stdout 是数据通道，因此 tcp2socket 的日志全部输出到 stderr，不会污染传输数据。
