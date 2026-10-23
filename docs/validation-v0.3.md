@@ -50,10 +50,35 @@ An earlier draft pre-validated the capability list in the initiator and deadlock
 
 Not covered by this PR: heartbeat/DEGRADED (PR-05C), doctor (PR-05D), gate (full CI rerun, fault-injection summary, session/control interop).
 
+## PR-05C — heartbeat / degraded failure detection (2026-10-23)
+
+Scope: `internal/control/heartbeat.go` — PING/PONG exchange over an established READY session, consecutive-miss budget, single-writer goroutine, fail-once callback contract. Session integration is test-verified only; no CLI or proxy changes and no heartbeat is forced onto ordinary TCP forwarding.
+
+Decisions frozen by tests:
+
+- Config `Interval/Timeout/MaxMissed`, defaults 10s/5s/3 (plan values); detection latency bounded by roughly `Interval*MaxMissed`. First PING is sent immediately; invalid config fails `StartHeartbeat` before any goroutine starts.
+- PONG must echo the session ID and reference an outstanding sequence; a duplicate, stale or unsolicited PONG fails the heartbeat immediately (`ErrStalePong`), as does any foreign session ID (`CheckSession` from PR-05B). `missed` resets only on a valid PONG; `missed >= MaxMissed` fails with `ErrHeartbeatTimeout`.
+- The plan's "single writer goroutine" is implemented literally: all frames toward the peer go through one bounded queue (depth 16) owned by one writer goroutine, so PINGs and PONG replies never interleave and a blocked write can never stall the read loop. This is what keeps synchronous transports (and the future mux) deadlock-free: the first draft answered PINGs from the read-loop goroutine and deadlocked two net.Pipe peers where every goroutine was simultaneously a blocked writer.
+- Failure contract: `fail(err)` runs exactly once — it stops the writer, then invokes `onFail(err)`. `Close()` stops without invoking `onFail`. Neither waits for a write blocked on a stalled transport; the caller closes the transport first. Marking the session DEGRADED, closing the transport and finishing the session are the caller's job; there is no automatic re-auth or reconnect.
+- A stalled peer (stops reading, never answers) is detected by the missed-pong budget even while a write is blocked, because only the writer goroutine is stranded. This is stronger than the intermediate serialized-mutex design, in which one blocked write froze the whole state machine.
+
+Required cases from the plan, now passing: timeout budget (`TestHeartbeatTimeout`), duplicate/stale PONG (`TestDuplicatePong`, `TestUnsolicitedPong`), foreign session ID (`TestHeartbeatForeignSession`), peer EOF (`TestHeartbeatPeerEOF`), simultaneous close of two live heartbeats with a goroutine-leak check (`TestSimultaneousClose`), write stall without state-machine stall (`TestWriteStall`), mutual echo loop with clean shutdown (`TestHeartbeatEchoLoop`), and the session contract (`TestHeartbeatMarksSessionDegraded`): on failure the callback marks READY→DEGRADED (observed as a permanent state event; the snapshot advances to CLOSING immediately by design), the session refuses new work, explicit Finish closes it exactly once, and no path returns it to READY.
+
+Local evidence (macOS 27.0.1 arm64, Go 1.26.1):
+
+| Check | Result |
+| --- | --- |
+| `go test -race -count=2 -timeout 90s ./internal/control` | PASS |
+| Fuzz `DecodeFrame` / `ParseErrorPayload` / `ParseCapabilityList`, 10s each | PASS |
+| `TCP2SOCKET_TEST_RACE=1 go test -race -count=1 -timeout 240s ./...` | PASS (all 8 packages incl. integration) |
+| `go vet`, `gofmt -l` | clean |
+
+Not covered by this PR: wiring the heartbeat into a live CLI session (v0.3 keeps session control as a foundation layer), doctor (PR-05D), gate (full CI rerun, fault-injection summary, session/control interop).
+
 ## Gate status (pending)
 
 - [x] PR-05B handshake + session ID isolation tests
-- [ ] PR-05C heartbeat + degraded handling tests
+- [x] PR-05C heartbeat + degraded handling tests
 - [ ] PR-05D doctor/version CLI
 - [ ] Full CI matrix green on the gate commit
 - [ ] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
