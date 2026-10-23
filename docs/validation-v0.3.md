@@ -174,7 +174,7 @@ Resource observability: `TestProxyResourceBaseline` samples the proxy **subproce
 - [x] PR-05C heartbeat + degraded handling tests
 - [x] PR-05D doctor/version CLI + stable event logs
 - [x] Post-review concurrency closure (session timestamp race, heartbeat missed-counter race, WriteFrame short writes, event ordering contract)
-- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577) and the closure commit (confirmed after push)
+- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577) and the concurrency-closure commit `684efaa` (run 39915280343)
 - [x] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
 
 Deferred to later stages per plan: v0.4 Mux design, v0.5 SOCKS listener/SSH transport, experimental PTY. The control layer remains decoupled from ordinary TCP forwarding.
