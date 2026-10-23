@@ -358,3 +358,92 @@ func TestHeartbeatMarksSessionDegraded(t *testing.T) {
 		t.Fatal("session Done did not fire after Finish")
 	}
 }
+
+// TestHeartbeatCloseDuringTraffic: Close() racing established echo traffic
+// must stop cleanly, report no failure and leave both loops exited.
+// TestSimultaneousClose closes an idle pair; this one closes mid-echo with
+// in-flight frames, exercising stopOnce/writer/read-loop interleavings.
+func TestHeartbeatCloseDuringTraffic(t *testing.T) {
+	a, b := net.Pipe()
+	hbA, failedA := startTestHeartbeat(t, a, fastCfg)
+	hbB, failedB := startTestHeartbeat(t, b, fastCfg)
+
+	expectNoFailure(t, failedA, 100*time.Millisecond)
+	expectNoFailure(t, failedB, time.Millisecond)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); hbA.Close() }()
+	go func() { defer wg.Done(); hbB.Close() }()
+	// Transports must close before joining: an in-flight write on the
+	// synchronous pipe unblocks only when the transport closes.
+	_ = a.Close()
+	_ = b.Close()
+	wg.Wait()
+
+	for i, hb := range []*Heartbeat{hbA, hbB} {
+		select {
+		case <-hb.Done():
+		case <-time.After(time.Second):
+			t.Fatalf("heartbeat %d did not stop", i)
+		}
+		if err := hb.Err(); err != nil {
+			t.Fatalf("clean close during traffic reported failure: %v", err)
+		}
+	}
+	select {
+	case err := <-failedA:
+		t.Fatalf("unexpected failure during clean close: %v", err)
+	case err := <-failedB:
+		t.Fatalf("unexpected failure during clean close: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestHeartbeatMissedCounterRace drives the exact interleaving that used to
+// race: tick's failure formatting re-read h.missed after releasing the lock
+// while a concurrent valid PONG reset it under the lock. The counter is now
+// captured as a lock-scoped local; this test overlaps both code paths
+// repeatedly so -race flags any regression of that capture.
+//
+// The Heartbeat is constructed directly (same package) with a discard writer
+// and no loop goroutine, so neither side can block: the test is about the
+// lock discipline, not transport behavior.
+func TestHeartbeatMissedCounterRace(t *testing.T) {
+	h := &Heartbeat{
+		sessionID:   testID,
+		cfg:         HeartbeatConfig{Interval: time.Hour, Timeout: time.Hour, MaxMissed: 1},
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
+		outstanding: make(map[uint32]time.Time),
+	}
+	h.writer = newFrameWriter(io.Discard, func(err error) { h.fail(err) })
+	defer h.writer.close()
+
+	// Per-round handshake: the peer registers an expired seq (forcing tick's
+	// fail path) plus a valid outstanding seq, then processes its PONG while
+	// the main goroutine runs tick. Without the handshake the tick loop can
+	// finish before the peer registers anything and the fail path never runs.
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			h.mu.Lock()
+			h.missed = 0
+			h.nextSeq++
+			valid := h.nextSeq
+			h.outstanding[valid] = time.Now().Add(time.Hour)  // never expires
+			h.outstanding[99999] = time.Now().Add(-time.Hour) // always expires
+			h.mu.Unlock()
+			ready <- struct{}{}
+			// Races the tick's failure formatting below; writes missed=0.
+			_ = h.HandleFrame(Frame{Type: TypePong, SessionID: testID, Sequence: valid})
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		<-ready
+		h.tick() // budget reached each round: (pre-fix) unlocked h.missed read
+	}
+	<-done
+}

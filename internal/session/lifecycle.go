@@ -19,6 +19,7 @@ type Session struct {
 	state       State
 	reason      CloseReason
 	updatedAt   time.Time
+	eventSeq    uint64
 	closeOnce   sync.Once
 	done        chan struct{}
 	observers   []Observer
@@ -37,7 +38,9 @@ func New() (*Session, error) {
 	if _, err := rand.Read(s.id[:]); err != nil {
 		return nil, fmt.Errorf("generate session id: %w", err)
 	}
-	s.emit(Event{SessionID: s.id, Type: EventCreated, To: StateInit, At: s.createdAt})
+	// Construction is pre-publication: no other goroutine can observe s yet.
+	s.eventSeq = 1
+	s.emit(Event{SessionID: s.id, Type: EventCreated, To: StateInit, At: s.createdAt, Seq: 1})
 	return s, nil
 }
 
@@ -77,10 +80,16 @@ func (s *Session) Transition(next State) error {
 		s.mu.Unlock()
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, current, next)
 	}
+	// Timestamp and sequence are captured as locals under the lock; the emit
+	// below runs unlocked and must never re-read the shared fields (they may
+	// have been advanced by a concurrent transition already).
 	s.state = next
-	s.updatedAt = time.Now()
+	s.eventSeq++
+	seq := s.eventSeq
+	at := time.Now()
+	s.updatedAt = at
 	s.mu.Unlock()
-	s.emit(Event{SessionID: s.id, Type: EventStateChanged, From: current, To: next, At: s.updatedAt})
+	s.emit(Event{SessionID: s.id, Type: EventStateChanged, From: current, To: next, At: at, Seq: seq})
 	return nil
 }
 
@@ -105,9 +114,12 @@ func (s *Session) Close(reason CloseReason) {
 		}
 		s.state = StateClosing
 		s.reason = reason
-		s.updatedAt = time.Now()
+		s.eventSeq++
+		seq := s.eventSeq
+		at := time.Now()
+		s.updatedAt = at
 		s.mu.Unlock()
-		s.emit(Event{SessionID: s.id, Type: EventCloseInitiated, From: from, To: StateClosing, Reason: reason, At: s.updatedAt})
+		s.emit(Event{SessionID: s.id, Type: EventCloseInitiated, From: from, To: StateClosing, Reason: reason, At: at, Seq: seq})
 	})
 }
 
@@ -120,10 +132,14 @@ func (s *Session) Finish() error {
 		return ErrClosed
 	}
 	s.state = StateClosed
-	s.updatedAt = time.Now()
+	s.eventSeq++
+	seq := s.eventSeq
+	at := time.Now()
+	s.updatedAt = at
+	reason := s.reason
 	hook := s.onFinish
 	s.mu.Unlock()
-	s.emit(Event{SessionID: s.id, Type: EventClosed, From: StateClosing, To: StateClosed, Reason: s.snapshotReason(), At: s.updatedAt})
+	s.emit(Event{SessionID: s.id, Type: EventClosed, From: StateClosing, To: StateClosed, Reason: reason, At: at, Seq: seq})
 	close(s.done)
 	if hook != nil {
 		hook(s)

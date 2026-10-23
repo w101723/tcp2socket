@@ -67,13 +67,20 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	return f, nil
 }
 
-// WriteFrame encodes f and writes it as a single buffer.
+// WriteFrame encodes f and writes it as a single buffer. A writer that
+// returns fewer bytes than the frame with a nil error is reported as
+// io.ErrShortWrite — accepting it would silently corrupt the framed stream.
+// This matters for the future mux, whose per-stream writers are custom
+// implementations that may legitimately return short writes.
 func WriteFrame(w io.Writer, f Frame) error {
 	buf, err := Encode(f)
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(buf)
+	n, err := w.Write(buf)
+	if err == nil && n != len(buf) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -267,4 +268,112 @@ func TestNoGoroutineLeak(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("goroutine leak: before=%d after=%d", before, runtime.NumGoroutine())
+}
+
+// TestConcurrentLifecycleEventOrdering is the post-review race closure.
+// Many goroutines drive the lifecycle while observers record events; with
+// the pre-fix code the emit path re-read s.updatedAt after releasing the
+// lock, which -race flags against concurrent Transition/Close/Finish and
+// Snapshot writers. The asserted contract:
+//
+//  1. per-session event Seq values are exactly 1..N with no gaps, and
+//  2. the sequence reconstructed by Seq is a legal state path ending CLOSED
+//     with non-decreasing At timestamps.
+//
+// Emission happens after the lock is released, so observers may receive
+// events out of transition order under contention; Seq is the authoritative
+// order and the timestamp is a lock-scoped local, never a shared re-read.
+func TestConcurrentLifecycleEventOrdering(t *testing.T) {
+	s, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var events []Event
+	s.OnEvent(func(e Event) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	})
+	if err := s.Transition(StateConnecting); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 200; j++ {
+				switch (i + j) % 4 {
+				case 0:
+					_ = s.Transition(StateHandshaking)
+				case 1:
+					_ = s.Transition(StateReady)
+				case 2:
+					_ = s.Snapshot()
+				default:
+					_ = s.Transition(StateDegraded)
+				}
+			}
+		}(i)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			// Blocks until Finish closes done; also exercises Wait racing
+			// concurrent transitions.
+			_ = s.Wait(context.Background())
+		}()
+	}
+	close(start)
+	time.Sleep(50 * time.Millisecond) // let the racers interleave
+	s.Close(ReasonCanceled)
+	if err := s.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	wg.Wait()
+
+	if state := s.Snapshot().State; state != StateClosed {
+		t.Fatalf("state = %s, want closed", state)
+	}
+	if err := s.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait after close: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) < 3 {
+		t.Fatalf("too few events recorded: %d", len(events))
+	}
+	// The created event (Seq 1) fired inside New, before OnEvent registered
+	// this observer; deliveries may otherwise be out of order. Reconstruct
+	// by Seq: the first observed event must be Seq 2 (the connecting
+	// transition) and the run must be gap-free from there.
+	sorted := make([]Event, len(events))
+	copy(sorted, events)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Seq < sorted[j].Seq })
+	if sorted[0].Seq != 2 || sorted[0].Type != EventStateChanged || sorted[0].To != StateConnecting {
+		t.Fatalf("first observed event = {Seq %d %s %s->%s}, want Seq 2 state_changed init->connecting",
+			sorted[0].Seq, sorted[0].Type, sorted[0].From, sorted[0].To)
+	}
+	for i, e := range sorted {
+		if e.Seq != uint64(i+2) {
+			t.Fatalf("event %d has Seq %d, want exactly %d (gap or duplicate)", i, e.Seq, i+2)
+		}
+		if i > 0 && e.At.Before(sorted[i-1].At) {
+			t.Fatalf("event %d timestamp %v precedes earlier event %v", i, e.At, sorted[i-1].At)
+		}
+		if i > 0 && sorted[i].Type != EventClosed && sorted[i].From != sorted[i-1].To {
+			t.Fatalf("event %d (%s) From=%s does not chain from previous To=%s",
+				i, e.Type, sorted[i].From, sorted[i-1].To)
+		}
+	}
+	if last := sorted[len(sorted)-1]; last.Type != EventClosed || last.To != StateClosed {
+		t.Fatalf("path must end with a closed event: last={%s %s->%s}", last.Type, last.From, last.To)
+	}
 }

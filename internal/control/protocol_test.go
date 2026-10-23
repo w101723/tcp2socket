@@ -238,3 +238,81 @@ func TestAppendFrame(t *testing.T) {
 	}
 	_ = io.Discard
 }
+
+// shortWriter returns a fixed byte count (possibly fewer than requested) with
+// a configurable error, mimicking custom stream writers the future mux will
+// plug into WriteFrame.
+type shortWriter struct {
+	n     int
+	wrote int
+	err   error
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	n := w.n
+	if n > len(p) {
+		n = len(p)
+	}
+	w.wrote += n
+	return n, w.err
+}
+
+// TestWriteFrameShortWrite: a writer that consumes fewer bytes than the frame
+// and reports nil must surface io.ErrShortWrite — silently accepting it would
+// corrupt the framed stream.
+func TestWriteFrameShortWrite(t *testing.T) {
+	f := Frame{Type: TypePing, SessionID: testID, Sequence: 1}
+
+	sw := &shortWriter{n: HeaderSize - 1}
+	if err := WriteFrame(sw, f); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short write err = %v, want io.ErrShortWrite", err)
+	}
+	if sw.wrote != HeaderSize-1 {
+		t.Fatalf("wrote = %d, want %d", sw.wrote, HeaderSize-1)
+	}
+
+	sw = &shortWriter{n: 1 << 20}
+	if err := WriteFrame(sw, f); err != nil {
+		t.Fatalf("full write err = %v", err)
+	}
+	if sw.wrote != HeaderSize {
+		t.Fatalf("wrote = %d, want %d", sw.wrote, HeaderSize)
+	}
+
+	boom := errors.New("boom")
+	sw = &shortWriter{n: 0, err: boom}
+	if err := WriteFrame(sw, f); !errors.Is(err, boom) {
+		t.Fatalf("writer error = %v, want boom", err)
+	}
+
+	// payload-bearing frames count total bytes, not just the header
+	fp := Frame{Type: TypeError, SessionID: testID, Sequence: 2, Payload: []byte{0x02, 'x', 'y'}}
+	sw = &shortWriter{n: HeaderSize + 2}
+	if err := WriteFrame(sw, fp); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("partial payload write err = %v, want io.ErrShortWrite", err)
+	}
+}
+
+// TestProtocolCloseRoundtrip freezes the CLOSE frame (0x06) on the wire:
+// header-only frame, identity through WriteFrame→ReadFrame. The mux layer
+// will rely on this type surviving transport boundaries unchanged.
+func TestProtocolCloseRoundtrip(t *testing.T) {
+	var buf bytes.Buffer
+	cf := Frame{Type: TypeClose, SessionID: testID, Sequence: 42}
+	if err := WriteFrame(&buf, cf); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	if buf.Len() != HeaderSize {
+		t.Fatalf("CLOSE frame size = %d, want header-only %d", buf.Len(), HeaderSize)
+	}
+	got, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if got.Type != TypeClose || got.Sequence != 42 || got.SessionID != testID || got.Payload != nil {
+		t.Fatalf("roundtrip mismatch: %+v", got)
+	}
+	if _, err := ReadFrame(&buf); !errors.Is(err, io.EOF) && !errors.Is(err, ErrTruncated) {
+		t.Fatalf("trailing read err = %v, want EOF or truncated", err)
+	}
+}

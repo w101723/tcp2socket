@@ -43,6 +43,8 @@ Cleanup compares file identity and disables Go's unconditional unlink-on-close b
 
 Verbose connection events are stable key=value lines containing `event`, `connection_id`, `source`, `reason`, directional byte counts (`s2t`/`t2s`) and `elapsed_ms`; `session_id` appears only when a control session exists (ordinary direct forwarding has none in v0.3). Events never contain business payload or identity credentials. In STDIO modes every log line still goes to stderr; stdout carries only protocol bytes. The doctor and version subcommands write their reports to stdout — they are not STDIO data modes.
 
+The v0.3 session/control layer (HELLO/ACK, PING/PONG heartbeat, session IDs) is not enabled on any forwarding path: `-l/-t`, `connect` and `socks-stdio` continue to dial and relay directly, with no handshake implied. Those features are exercised by tests and are available to future versions through an explicit opt-in; existing traffic to plain TCP/Unix services is unaffected.
+
 ## Rollback
 
 Keep the previous binary separately and stop the upgraded listener before replacing it. No persistent configuration or protocol migration is introduced. Rolling back restores the previous lifecycle bugs and unbounded accept behavior, so use only in a controlled environment.

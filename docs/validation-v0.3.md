@@ -97,6 +97,56 @@ Local evidence (macOS 27.0.1 arm64, Go 1.26.1):
 | Smoke: `version`, `doctor`, `doctor --inspect-nat`, `--version` | outputs as documented; doctor exit 0 (build_info WARN, nat UNAVAILABLE off-Linux) |
 | Full matrix below | PASS |
 
+## Post-review concurrency closure (2026-10-23)
+
+A code review of the v0.3 gate found one latent data race in `internal/session`; the same class was then hunted across the control layer. All fixes are lock-scoped captures — no behavior change on the happy path.
+
+### Fixed races
+
+| Location | Defect | Fix |
+| --- | --- | --- |
+| `session.Transition` / `Close` / `Finish` | event was emitted after releasing the state lock but read `s.updatedAt` inside the emit literal — a concurrent transition/Close/Finish could advance the field, racing the read | `at := time.Now()` and the event sequence are captured as locals **under** the lock; the emit references only locals. `Finish` also stopped re-reading the reason through `snapshotReason()` outside the lock |
+| `control.Heartbeat.tick` | the failure message formatting re-read `h.missed` after unlocking while a concurrent valid PONG resets it under the lock | `missed := h.missed` captured under the lock |
+
+### Event ordering contract
+
+Emission remains outside the lock (observers must be able to re-enter), so under contention two goroutines can deliver events out of transition order. `session.Event` now carries `Seq`, a per-session monotonic sequence assigned under the state lock; observers reconstruct the authoritative order by `Seq`. `At` timestamps are lock-scoped locals, so sorting by `Seq` also yields non-decreasing timestamps. This is the contract the mux will build session traces on.
+
+### WriteFrame short writes (mux preparation)
+
+`control.WriteFrame` previously ignored the writer's returned count: a custom stream returning `n < len(frame)` with a nil error would silently truncate the framed stream. It now reports `io.ErrShortWrite`, which the heartbeat's single writer propagates as a failure. `ReadFrame` already used `io.ReadFull`. Custom mux stream writers may now return short writes per the `io.Writer` contract.
+
+### Regression tests (assertion + verified detection)
+
+- `TestConcurrentLifecycleEventOrdering` — 8 goroutines drive transitions/snapshots/Wait while 4 waiters block; asserts Seq 1..N gap-free, legal From→To chaining, non-decreasing `At`, and CLOSED terminal state. Detection verified against the pre-fix code: DATA RACE on run 3 of 8.
+- `TestHeartbeatMissedCounterRace` — white-box round-by-round interleaving of the budget-failure path and a concurrent valid PONG. Detection verified against the pre-fix code: DATA RACE on run 1 of 5.
+- `TestWriteFrameShortWrite` — short write with nil error → `io.ErrShortWrite` (header-only and payload frames); full write passes; writer errors propagate unchanged.
+- `TestProtocolCloseRoundtrip` — CLOSE (0x06) frame is header-only and round-trips identically through `WriteFrame`→`ReadFrame`.
+- `TestHeartbeatCloseDuringTraffic` — Close() during established echo traffic stops both loops cleanly with no failure report, transports closed before join.
+
+Evidence (macOS 27.0.1 arm64, Go 1.26.1): `go test -race -count=2 ./internal/session ./internal/control` PASS; `gofmt -l` / `go vet` clean; full matrix re-run recorded in the gate checklist.
+
+## Runtime integration status (read before assuming behavior)
+
+The v0.3 control layer is a **foundation layer and is not wired into the forwarding paths**. Concretely:
+
+- `proxy.ListenAndServe` still constructs `transport.DirectDialer` and `proxy.Relay`; it creates no `session.Session`, performs no HELLO/ACK, and starts no heartbeat.
+- `connect` and `socks-stdio` likewise relay over the direct dialer only.
+- `session`, `control` (frame/handshake/heartbeat) are exercised by unit and integration tests and are ready for an explicit integrator, but no shipped CLI path depends on them.
+
+Consequences: ordinary TCP proxying does not gain heartbeat-based failure detection, session IDs, or stale-session isolation from v0.3 — by design (plan §6: forcing a handshake onto existing direct forwarding would break interop with plain TCP services). `doctor` and `version` are standalone diagnostics. Any future wiring is a v0.4+ decision behind an explicit flag/protocol negotiation.
+
+## Protocol freeze for the v0.4 baseline
+
+T2S1 version 1 is frozen as of gate commit `444dd46`:
+
+- 32-byte header: magic `T2S1` (4) + version (1, =1) + type (1) + reserved flags (2, must be 0) + payload length (4, BE, max 4096) + session ID (16) + sequence (4).
+- Types `0x01`–`0x06`: HELLO, HELLO_ACK, PING, PONG, ERROR, CLOSE; unknown types and versions rejected at decode and encode.
+- Capability `0x01` heartbeat; ERROR codes `0x01` unsupported_capability, `0x02` protocol_error, `0x03` unauthorized.
+- Framing invariants: length validated before allocation, trailing data rejected, short writes surfaced, one writer goroutine per direction.
+
+Any change to these bytes requires a `ProtocolVersion` bump plus updated golden-byte tests (`TestHeaderLayout`) — the v0.4 mux design must extend, not mutate, this baseline.
+
 ## v0.3 Gate
 
 ### Fault injection summary
@@ -123,7 +173,8 @@ Resource observability: `TestProxyResourceBaseline` samples the proxy **subproce
 - [x] PR-05B handshake + session ID isolation tests
 - [x] PR-05C heartbeat + degraded handling tests
 - [x] PR-05D doctor/version CLI + stable event logs
-- [x] Full CI matrix green on the gate commit `444dd46` (run 39909351577: ubuntu-latest/macos-15 Go 1.22.x + ubuntu-latest/macos-latest stable, incl. per-package fuzz steps)
+- [x] Post-review concurrency closure (session timestamp race, heartbeat missed-counter race, WriteFrame short writes, event ordering contract)
+- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577) and the closure commit (confirmed after push)
 - [x] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
 
 Deferred to later stages per plan: v0.4 Mux design, v0.5 SOCKS listener/SSH transport, experimental PTY. The control layer remains decoupled from ordinary TCP forwarding.

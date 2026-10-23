@@ -235,6 +235,9 @@ func (h *Heartbeat) loop() {
 // tick expires unanswered pings, checks the consecutive-miss budget and sends
 // the next ping. It returns false once the heartbeat has stopped.
 func (h *Heartbeat) tick() bool {
+	// All shared state is read under the lock and captured as locals; the
+	// fail path below runs unlocked and a concurrent valid PONG may already
+	// be resetting h.missed.
 	h.mu.Lock()
 	now := time.Now()
 	for seq, sent := range h.outstanding {
@@ -244,6 +247,7 @@ func (h *Heartbeat) tick() bool {
 		}
 	}
 	fail := h.missed >= h.cfg.MaxMissed
+	missed := h.missed
 	var seq uint32
 	if !fail {
 		h.nextSeq++
@@ -253,7 +257,7 @@ func (h *Heartbeat) tick() bool {
 	h.mu.Unlock()
 
 	if fail {
-		h.fail(fmt.Errorf("%w: %d consecutive missed pong(s), max %d", ErrHeartbeatTimeout, h.missed, h.cfg.MaxMissed))
+		h.fail(fmt.Errorf("%w: %d consecutive missed pong(s), max %d", ErrHeartbeatTimeout, missed, h.cfg.MaxMissed))
 		return false
 	}
 	if err := h.writer.enqueue(Frame{Type: TypePing, SessionID: h.sessionID, Sequence: seq}); err != nil {

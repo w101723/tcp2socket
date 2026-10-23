@@ -20,6 +20,11 @@ type Event struct {
 	From, To  State
 	Reason    CloseReason
 	At        time.Time
+	// Seq is a per-session monotonic sequence assigned while the state lock
+	// is held. Emission happens after the lock is released, so two events can
+	// reach observers out of transition order; Seq is the authoritative order
+	// for reconstruction (see the concurrency closure tests).
+	Seq uint64
 }
 
 type Observer func(Event)
