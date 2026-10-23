@@ -1,0 +1,39 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.22.x', stable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Race and integration tests
+        run: TCP2SOCKET_TEST_RACE=1 go test -race -timeout 180s ./...
+      - name: Fuzz SOCKS request parser
+        run: go test ./internal/socks5 -run '^$' -fuzz '^FuzzReadRequest$' -fuzztime 5s -parallel 2
+      - name: Build release targets
+        shell: bash
+        run: |
+          for os in darwin linux; do
+            for arch in amd64 arm64; do
+              CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -o "$RUNNER_TEMP/tcp2socket-$os-$arch" .
+            done
+          done

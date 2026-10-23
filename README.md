@@ -11,14 +11,15 @@
 - `socks-stdio` 模式：通过 stdin/stdout 提供 SOCKS5 `CONNECT` 服务，不依赖额外 SOCKS 守护进程
 - 支持 TCP 半关闭，适用于需要请求完成后继续读取响应的协议
 - 可配置目标拨号超时和代理连接空闲超时
-- Unix Socket 自动清理旧 socket，并拒绝删除普通文件
+- Unix Socket 仅清理当前用户拥有、且明确拒绝连接的残留 socket；拒绝覆盖活跃监听、普通文件和符号链接
+- 有界连接数和待处理队列，可配置优雅退出期限，`-v` 输出连接终态、方向字节数和结束原因
 - 单一静态二进制、无第三方依赖
 
 ## 安装
 
 ### 从 Release 下载
 
-每次推送到 `main` 都会创建一个以 UTC 时间戳 `YYYYMMDDHHmm` 标识的 Release（例如 `202608201836`），并提供：
+每次推送到 `main` 都会创建带 UTC 秒级时间戳、提交短哈希和运行编号的独立 Release，标签绑定实际构建提交，并附带 `SHA256SUMS`。历史版本使用分钟级时间戳。发布提供：
 
 | 平台 | 文件名 |
 | --- | --- |
@@ -110,6 +111,9 @@ tcp2socket -l <listen> -t <target> [options]
 | `-idle-timeout` | `0` | 连接空闲超时；`0` 表示关闭 |
 | `-unix-mode` | `0660` | 监听 Unix Socket 的权限 |
 | `-v` | `false` | 输出连接日志到 stderr |
+| `-max-connections` | `128` | 活跃转发/拨号的最大数量 |
+| `-max-pending-accept` | `64` | 已接入连接的有界等待队列；满后立即关闭新连接 |
+| `-shutdown-timeout` | `10s` | 信号退出时等待存量连接的期限；到期关闭，`0` 立即关闭 |
 
 ### 2. `connect`：STDIO ↔ Socket
 
@@ -197,16 +201,27 @@ ssh -T host 'exec tcp2socket socks-stdio'
 
 - `socks-stdio` 无认证。请仅通过受信任的 SSH 会话、受控 stdin/stdout 或其他受限传输方式使用它。
 - 不要将无认证 SOCKS 服务直接暴露到不可信网络。
-- 监听 Unix Socket 时，工具只会移除已有的 socket；若目标路径是普通文件，程序会拒绝删除。
+- 监听 Unix Socket 时，仅对当前用户拥有且连接返回 `ECONNREFUSED` 的残留 socket 做清理；活跃监听、普通文件、符号链接或无法判定的路径会导致启动失败。
+- Unix Socket 应放在权限为 `0700` 的私有目录中，敏感服务建议 `-unix-mode 0600`。路径检查不是原子事务，不应依赖它抵御能修改父目录的恶意进程。
 - 在生产环境中，请按实际需要设置 `-dial-timeout`、`-idle-timeout` 与 `-unix-mode`。
 
 ## 开发与验证
 
 ```bash
 gofmt -w .
-go test ./...
+go test -timeout 180s ./...
+TCP2SOCKET_TEST_RACE=1 go test -race -timeout 180s ./...
 go vet ./...
+go test ./internal/socks5 -run '^$' -fuzz '^FuzzReadRequest$' -fuzztime 5s -parallel 2
 ```
+
+当前开发阶段落实升级规格 PR-01～PR-03：回归基线、模块拆分、Relay 正确性和资源边界；尚未实现 Session/Mux、doctor、独立 SOCKS 监听或 PTY 后端。
+
+- [架构说明](docs/architecture.md)
+- [CLI 兼容、关闭语义与回滚](docs/compatibility.md)
+- [本阶段验证报告](docs/validation-v0.2.md)
+
+STDIO 模式下，stdin EOF 后会继续等待完整响应，不再使用固定 200ms 截断；目标 EOF 后进程结束，即使 stdin 仍打开。普通 Socket 代理仍支持双向半关闭。详见兼容说明。
 
 ## License
 
