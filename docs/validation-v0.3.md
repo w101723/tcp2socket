@@ -123,7 +123,7 @@ Resource observability: `TestProxyResourceBaseline` samples the proxy **subproce
 - [x] PR-05B handshake + session ID isolation tests
 - [x] PR-05C heartbeat + degraded handling tests
 - [x] PR-05D doctor/version CLI + stable event logs
-- [ ] Full CI matrix green on the gate commit (four runners; confirmed after push)
+- [x] Full CI matrix green on the gate commit `444dd46` (run 39909351577: ubuntu-latest/macos-15 Go 1.22.x + ubuntu-latest/macos-latest stable, incl. per-package fuzz steps)
 - [x] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
 
 Deferred to later stages per plan: v0.4 Mux design, v0.5 SOCKS listener/SSH transport, experimental PTY. The control layer remains decoupled from ordinary TCP forwarding.
