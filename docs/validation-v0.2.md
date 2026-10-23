@@ -1,6 +1,6 @@
 # Correctness-phase validation report
 
-Date: 2026-10-22. Scope: the first implementation batch of upgrade-spec PR-01–PR-03, on `dev`. This is not v1.0 acceptance and no release was published.
+Date: 2026-10-22, updated 2026-10-23 after the first `dev` push. Scope: the first implementation batch of upgrade-spec PR-01–PR-03, on `dev`. This is not v1.0 acceptance and no release was published.
 
 ## Local evidence
 
@@ -32,8 +32,12 @@ The benchmark `go test ./internal/proxy -run '^$' -bench '^BenchmarkRelay$' -ben
 - Active-connection SIGTERM with 100ms drain deadline, capacity overflow and queued-work disposal.
 - Active Unix listener protection, stale listener cleanup, ordinary file/symlink rejection, configured permissions and cleanup preserving a replaced path.
 - 1MiB streaming SHA-256 verification and eight concurrent isolated transfers.
+- 100MiB streaming SHA-256 round trip through a real proxy process and 32 concurrent isolated streams, each verified end to end.
+- Proxy resource baseline: repeated round trips, SIGTERM stop, and post-stop goroutine sanity in the test binary.
 
 The first end-to-end run correctly caught that closing inherited blocking stdin did not interrupt macOS reads. The adapter now duplicates/registers file descriptors with Go's poller before copying. Final full standard and race runs passed after that fix. The test process helper also uses completion broadcasts so repeated cleanup cannot consume a result twice and deadlock.
+
+Writing the stress tests surfaced a wrong expectation worth recording: proxy mode is a long-running service, so it keeps accepting after all client streams close and must be stopped by signal — this matches legacy behavior, and the tests now stop it with SIGTERM and assert a bounded exit. The FD leak check is currently a no-op on macOS test hosts (`/dev/fd` and `/proc/self/fd` unavailable to the test binary); it activates on Linux hosts where that interface is readable.
 
 ## Compatibility and resource impact
 
@@ -45,6 +49,8 @@ CLI error categories remain the old 0/1/2 categories. Input validation is strict
 
 No authentication bypass, firewall modification, PTY backend or network SOCKS listener is implemented. Socket parent-directory mutation by an attacker is outside the filesystem safety guarantee; use a private directory. Stream implementations and custom Dialers must honor close/cancel contracts. Logs contain metadata, not payload or credentials.
 
-New CI defines macOS/Linux Go 1.22 and stable runtime/race checks, but it has not run remotely in this work. Linux runtime, amd64 runtime and Go 1.22 execution are therefore **not locally verified**. Four-target cross-compilation is not runtime acceptance.
+CI first ran on the pushed `dev` commit d9db1c2 (workflow run 39889259425): Ubuntu Go 1.22/stable and macOS stable passed; **macOS `macos-latest` (macOS 26) + Go 1.22.12 failed** at dynamic-loader startup (`dyld: missing LC_UUID load command`, abort trap) before executing any assertion, for the proxy/socks5/transport/integration test binaries. The same commit passed all four target matrix cells on Ubuntu and the Go-stable macOS runner, so no test failure implicates the relay or SOCKS logic. The matrix now pins the Go 1.22 macOS cell to `macos-15`; that cell has not yet re-run remotely.
 
-No 100MiB/32-/64-connection stress run, goroutine/FD soak baseline, 24h/72h soak or hostile-directory TOCTOU proof is claimed. Session/Mux, doctor/version CLI, local IPC, standalone SOCKS, authorized SSH backend and experimental PTY remain future stages. No license is selected on the owner's behalf. Changes remain uncommitted and unpublished.
+New CI defines macOS/Linux Go 1.22 and stable runtime/race checks. Locally verified here: macOS arm64 runtime and test execution. Remotely observed as passing: Ubuntu Go 1.22/stable and macOS stable. Not yet verified: the re-pinned macOS 15 + Go 1.22 cell and linux/amd64 runtime; four-target cross-compilation is not runtime acceptance.
+
+No 64-connection stress run, long-duration FD/goroutine soak, 24h/72h soak or hostile-directory TOCTOU proof is claimed. The FD-leak check needs a Linux host to report real numbers. Session/Mux, doctor/version CLI, local IPC, standalone SOCKS, authorized SSH backend and experimental PTY remain future stages. No license is selected on the owner's behalf.

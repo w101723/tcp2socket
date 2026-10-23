@@ -13,8 +13,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        go: ['1.22.x', stable]
+        include:
+          - os: ubuntu-latest
+            go: '1.22.x'
+          - os: ubuntu-latest
+            go: stable
+          - os: macos-15
+            go: '1.22.x'
+          - os: macos-latest
+            go: stable
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
