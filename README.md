@@ -13,6 +13,8 @@
 - 可配置目标拨号超时和代理连接空闲超时
 - Unix Socket 仅清理当前用户拥有、且明确拒绝连接的残留 socket；拒绝覆盖活跃监听、普通文件和符号链接
 - 有界连接数和待处理队列，可配置优雅退出期限，`-v` 输出连接终态、方向字节数和结束原因
+- `doctor` 只读自检：回环 TCP 探测（可发现 NAT 改写回环源地址类异常）、临时 Unix Socket 自测、文件描述符上限
+- `version` / `-version`：输出版本、提交、Go 版本与平台（构建时经 `-ldflags` 注入）
 - 单一静态二进制、无第三方依赖
 
 ## 安装
@@ -162,6 +164,41 @@ tcp2socket socks-stdio [options]
 
 不支持 SOCKS4、用户名/密码认证、`BIND` 或 UDP ASSOCIATE。每个进程处理一个 SOCKS5 会话；该模式不在单条 stdio 通道上进行多路复用。
 
+### 4. `doctor`：只读自检
+
+```bash
+./tcp2socket doctor
+./tcp2socket doctor --inspect-nat   # Linux，只读提示，不修改任何规则
+```
+
+每项检查输出 `PASS/WARN/FAIL/UNAVAILABLE`，并受单检查超时约束；存在 `FAIL` 时退出码为 1（`WARN`/`UNAVAILABLE` 仍为 0）。默认包含：
+
+- `build_info`：版本、提交、Go 版本与平台；未经 `-ldflags` 注入时为 `dev/unknown` 并提示 `WARN`
+- `loopback_tcp`：对 `127.0.0.1` 临时端口做回显探测，并校验被接受连接的源地址仍为回环——曾出现过的 dubhe-vpn 类问题（NAT 无条件 MASQUERADE 改写回环 SYN 源地址）会在此暴露为 `FAIL`，无需 tcpdump 或提权
+- `unix_socket`：在用户拥有的临时目录内完成 listen/dial/回显/清理验证，结束后移除全部临时文件
+- `fd_limit`：报告 `nofile` 软/硬上限（平台不支持时 `UNAVAILABLE`）
+
+`--inspect-nat` 仅在 Linux 且显式启用时读取 `iptables-save -t nat`，对“无 `-d`/`-o` 限制的 MASQUERADE 规则”给出加回环例外的建议；**只诊断，不实施修复**，不修改 iptables/nft/容器网络。
+
+### 5. `version`：构建信息
+
+```bash
+./tcp2socket version
+# version=dev
+# commit=unknown
+# go=go1.26.1
+# os/arch=darwin/arm64
+```
+
+发布构建注入元信息：
+
+```bash
+go build -ldflags "-X tcp2socket/internal/buildinfo.Version=v0.3.0 \
+                   -X tcp2socket/internal/buildinfo.Commit=$(git rev-parse --short HEAD)" .
+```
+
+代理模式同时支持 `tcp2socket --version`。
+
 ## SSH 场景
 
 ### 透传至远端已有服务
@@ -215,11 +252,12 @@ go vet ./...
 go test ./internal/socks5 -run '^$' -fuzz '^FuzzReadRequest$' -fuzztime 5s -parallel 2
 ```
 
-当前开发阶段落实升级规格 PR-01～PR-03：回归基线、模块拆分、Relay 正确性和资源边界；尚未实现 Session/Mux、doctor、独立 SOCKS 监听或 PTY 后端。
+当前开发阶段落实升级规格 PR-01～PR-05：回归基线、模块拆分、Relay 正确性和资源边界，以及 v0.3 会话控制基础层（Session 状态机、T2S1 控制帧/握手/心跳、doctor/version 诊断）。尚未实现 Mux 多路复用、独立 SOCKS 监听或 PTY 后端（分别安排到 v0.4/v0.5/实验模块）。
 
 - [架构说明](docs/architecture.md)
 - [CLI 兼容、关闭语义与回滚](docs/compatibility.md)
-- [本阶段验证报告](docs/validation-v0.2.md)
+- [v0.2 验证报告](docs/validation-v0.2.md)
+- [v0.3 验证报告](docs/validation-v0.3.md)
 
 STDIO 模式下，stdin EOF 后会继续等待完整响应，不再使用固定 200ms 截断；目标 EOF 后进程结束，即使 stdin 仍打开。普通 Socket 代理仍支持双向半关闭。详见兼容说明。
 

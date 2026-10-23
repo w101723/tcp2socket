@@ -35,6 +35,14 @@ The legacy permission default is still 0660. Prefer a private 0700 parent direct
 
 Cleanup compares file identity and disables Go's unconditional unlink-on-close behavior, so an already observed replacement path is preserved. Lstat/check/unlink is not an atomic filesystem transaction: a hostile process able to mutate the parent directory can still race it. A private parent directory remains a security requirement; this code is not a defense against a malicious same-UID process.
 
+## Diagnostics and event logs (v0.3)
+
+`tcp2socket doctor` performs bounded, read-only local self-checks — build info, a loopback TCP echo that verifies the accepted source stays loopback (the dubhe-vpn NAT-rewrite signature), a temporary user-owned unix socket listen/dial/echo/cleanup, and file descriptor limits where the platform exposes them. Each check reports PASS/WARN/FAIL/UNAVAILABLE under a per-check timeout; exit code 1 means at least one FAIL, while WARN and UNAVAILABLE keep exit 0. The opt-in Linux `--inspect-nat` runs `iptables-save -t nat` read-only and prints suggestions about unconditional MASQUERADE rules; nothing is ever modified and no persistent management port is bound.
+
+`tcp2socket version` and the additive proxy flag `--version` print `version`, `commit`, `go` and `os/arch`. Build metadata is injected with `-ldflags -X tcp2socket/internal/buildinfo.Version=... -X tcp2socket/internal/buildinfo.Commit=...`; a plain `go build` shows `dev`/`unknown`. These are new subcommands/flags: all legacy invocations parse exactly as before.
+
+Verbose connection events are stable key=value lines containing `event`, `connection_id`, `source`, `reason`, directional byte counts (`s2t`/`t2s`) and `elapsed_ms`; `session_id` appears only when a control session exists (ordinary direct forwarding has none in v0.3). Events never contain business payload or identity credentials. In STDIO modes every log line still goes to stderr; stdout carries only protocol bytes. The doctor and version subcommands write their reports to stdout — they are not STDIO data modes.
+
 ## Rollback
 
 Keep the previous binary separately and stop the upgraded listener before replacing it. No persistent configuration or protocol migration is introduced. Rolling back restores the previous lifecycle bugs and unbounded accept behavior, so use only in a controlled environment.

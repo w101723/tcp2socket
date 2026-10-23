@@ -75,10 +75,55 @@ Local evidence (macOS 27.0.1 arm64, Go 1.26.1):
 
 Not covered by this PR: wiring the heartbeat into a live CLI session (v0.3 keeps session control as a foundation layer), doctor (PR-05D), gate (full CI rerun, fault-injection summary, session/control interop).
 
-## Gate status (pending)
+## PR-05D — doctor / version CLI and stable event logs (2026-10-23)
+
+Scope: `internal/doctor`, `internal/buildinfo`, `internal/logging`, CLI wiring (`doctor`, `version`, `--version`), `proxy.Event.SessionID`. No change to forwarding paths, no handshake forced onto ordinary TCP, no persistent management port, no new third-party dependency.
+
+Spec compliance (plan §5):
+
+- `doctor` runs bounded read-only checks, each reported PASS/WARN/FAIL/UNAVAILABLE under a per-check timeout (default 3s, hard cap 30s). Exit code 1 only when a check FAILs; WARN and UNAVAILABLE keep exit 0. Default checks: `build_info` (WARN while ldflags metadata is dev/unknown), `loopback_tcp` (127.0.0.1 echo probe verifying the accepted source stays loopback — the dubhe-vpn unconditional-SNAT signature, surfaced without privileges or tcpdump), `unix_socket` (temp-dir listen/dial/echo/cleanup, files removed afterwards), `fd_limit` (UNAVAILABLE where the platform does not expose rlimits).
+- `--inspect-nat` is opt-in and Linux-gated; it runs `iptables-save -t nat` read-only and flags MASQUERADE rules lacking a `-d`/`-o` condition (the loopback-rewrite shape) with a suggestion to add a loopback exception. Nothing is executed, modified or repaired; doctor never touches iptables/nft/container networking anywhere.
+- `version` prints `version`/`commit`/`go`/`os-arch`, one key=value per line; ldflags targets `internal/buildinfo`, defaults stay `dev`/`unknown`; the additive proxy flag `--version` prints the same block.
+- Event logs are unified through `internal/logging`: stable key=value lines, values quoted only when needed so field parsing survives. `closed`/`rejected` events carry `connection_id`, `source`, `reason`, `s2t`/`t2s`, `elapsed_ms`, and `session_id` only when a control session exists (`proxy.Event.SessionID` added; ordinary direct forwarding leaves it empty). STDIO modes keep every log on stderr; no event carries business payload or identity credentials. `session list/status/stop` is intentionally absent — no fake management commands without a designed local IPC and access model.
+- Legacy compatibility: new subcommands and flags only; all existing invocations, exit codes and stderr notices parse exactly as before (integration `TestCLIHelpAndExitCodes`, `TestExpectedNewProxyFlags` still pass unchanged).
+
+Tests: `internal/doctor` (exit codes via injected checks, status validation, deadline-bounded loopback probe, dubhe-vpn source classification, MASQUERADE parsing incl. long-form flags), `internal/logging` (field order, quoting, odd pairs, nil safety, concurrent line integrity), integration `TestVersionSubcommand`, `TestProxyVersionFlag`, `TestDoctorSubcommand`, `TestDoctorInspectNATPlatformGate`, `TestDoctorHelpFlags`.
+
+Local evidence (macOS 27.0.1 arm64, Go 1.26.1):
+
+| Check | Result |
+| --- | --- |
+| `go test -race -count=2 ./internal/doctor ./internal/logging` | PASS |
+| Smoke: `version`, `doctor`, `doctor --inspect-nat`, `--version` | outputs as documented; doctor exit 0 (build_info WARN, nat UNAVAILABLE off-Linux) |
+| Full matrix below | PASS |
+
+## v0.3 Gate
+
+### Fault injection summary
+
+Plan §7 requires deterministic terminal states for: control-channel disconnect, PING/PONG loss, half frames with EOF, and simultaneous close on both ends. Evidence (all passing locally, see tables above):
+
+| Fault | Tests | Outcome |
+| --- | --- | --- |
+| Transport EOF mid-handshake | `TestHandshakePeerEOF`, `TestHandshakeWrongFirstFrame`, `TestHandshakeTimeout` | structured failure, never READY, bounded by deadline |
+| Half frames / truncated stream | `TestTruncatedFrame`, `TestReadFramePartialWrites`, `TestReadFrameTruncatedStream`, `FuzzDecodeFrame` (~1.9M execs) | rejected before allocation, no panic, no hang |
+| Wrong version / oversized length / trailing data | `TestUnsupportedVersion`, `TestOversizedPayload`, `TestHeaderRejections`, `TestTrailingData` | rejected before payload read; 4096 limit proven |
+| Stale / foreign session ID | `TestOldSessionID`, `TestHeartbeatForeignSession` | foreign frames terminate the heartbeat immediately; no cross-session READY |
+| PING/PONG loss | `TestHeartbeatTimeout`, `TestWriteStall` | detection bounded by `Interval*MaxMissed`; `fail` exactly once even while a write is blocked |
+| Duplicate / unsolicited PONG | `TestDuplicatePong`, `TestUnsolicitedPong` | immediate `ErrStalePong` termination |
+| Simultaneous close on both ends | `TestSimultaneousClose` (incl. goroutine-leak check), session `Close`/`CloseAll`/cancel tests | both sides reach `Done`, no failure reported, no goroutines left |
+| Transport stall (peer stops reading) | `TestWriteStall` | only the writer goroutine is stranded; missed-pong detection continues and bounds the failure |
+| Signals / delayed EOF (legacy faults) | `TestProxySIGTERMBoundedShutdown`, `TestSocksHandshakeWaitingSIGTERM`, `TestDelayedResponseNoTruncation`, `TestTargetEOFStdinOpenProcessExit` | exit bounded, v0.2 behavior preserved |
+| stdout discipline | `TestConnectStdoutNoPollution` + STDIO integration | proxy/connect/socks-stdio stdout carries protocol bytes only; only `version`/`doctor` (non-STDIO modes) write stdout reports |
+
+Resource observability: `TestProxyResourceBaseline` samples the proxy **subprocess** (lsof on macOS, /proc/<pid>/fd on Linux) against a baseline; 100MiB hash, 32-way concurrency and 8-stream mixed scenarios pass with bounded FD growth. 64-way concurrency and 24h/72h soak are NOT claimed here (plan §7 lists them as further evidence, not a v0.3 gate item).
+
+### Gate checklist
 
 - [x] PR-05B handshake + session ID isolation tests
 - [x] PR-05C heartbeat + degraded handling tests
-- [ ] PR-05D doctor/version CLI
-- [ ] Full CI matrix green on the gate commit
-- [ ] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
+- [x] PR-05D doctor/version CLI + stable event logs
+- [ ] Full CI matrix green on the gate commit (four runners; confirmed after push)
+- [x] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
+
+Deferred to later stages per plan: v0.4 Mux design, v0.5 SOCKS listener/SSH transport, experimental PTY. The control layer remains decoupled from ordinary TCP forwarding.

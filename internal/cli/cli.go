@@ -8,12 +8,15 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"tcp2socket/internal/buildinfo"
 	"tcp2socket/internal/endpoint"
+	"tcp2socket/internal/logging"
 	"tcp2socket/internal/proxy"
 	"tcp2socket/internal/socks5"
 	"tcp2socket/internal/transport"
@@ -30,7 +33,7 @@ const (
 
 func Run(args []string, stdin io.ReadCloser, stdout io.WriteCloser, stderr io.Writer) int {
 	if len(args) == 0 {
-		return runProxyCLI([]string{}, stderr)
+		return runProxyCLI([]string{}, stdout, stderr)
 	}
 
 	sub := args[0]
@@ -39,11 +42,15 @@ func Run(args []string, stdin io.ReadCloser, stdout io.WriteCloser, stderr io.Wr
 		return runSocksStdioCLI(args[1:], stdin, stdout, stderr)
 	case "connect":
 		return runConnectCLI(args[1:], stdin, stdout, stderr)
+	case "doctor":
+		return runDoctorCLI(args[1:], stdout, stderr)
+	case "version":
+		return runVersionCLI(args[1:], stdout, stderr)
 	default:
 		if !strings.HasPrefix(sub, "-") {
 			return runConnectCLI(args, stdin, stdout, stderr)
 		}
-		return runProxyCLI(args, stderr)
+		return runProxyCLI(args, stdout, stderr)
 	}
 }
 
@@ -58,6 +65,10 @@ Connect mode:
 
 SOCKS5 over STDIO mode:
   tcp2socket socks-stdio [options]
+
+Diagnostics:
+  tcp2socket doctor [options]
+  tcp2socket version
 
 nc-compatible shorthand:
   tcp2socket <target>
@@ -94,26 +105,31 @@ Examples:
   nc-compatible shorthand:
     tcp2socket 127.0.0.1:8999
 
+  Diagnostics:
+    tcp2socket doctor
+    tcp2socket version
+
 Options:
 `)
 	fs.SetOutput(out)
 	fs.PrintDefaults()
 }
 
-func runProxyCLI(args []string, stderr io.Writer) int {
+func runProxyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	fs := flag.NewFlagSet("tcp2socket", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
 	var (
-		listenStr  string
-		targetStr  string
-		dialTO     time.Duration
-		idleTO     time.Duration
-		shutdownTO time.Duration
-		maxConns   int
-		maxPending int
-		unixMode   string
-		verbose    bool
+		listenStr   string
+		targetStr   string
+		dialTO      time.Duration
+		idleTO      time.Duration
+		shutdownTO  time.Duration
+		maxConns    int
+		maxPending  int
+		unixMode    string
+		verbose     bool
+		showVersion bool
 	)
 
 	fs.StringVar(&listenStr, "listen", "", "listen endpoint: tcp://0.0.0.0:8080 or unix:///tmp/in.sock")
@@ -127,6 +143,7 @@ func runProxyCLI(args []string, stderr io.Writer) int {
 	fs.IntVar(&maxPending, "max-pending-accept", defaultMaxPending, "maximum pending accept queue size")
 	fs.StringVar(&unixMode, "unix-mode", defaultUnixMode, "permission mode for listened unix socket")
 	fs.BoolVar(&verbose, "v", false, "verbose connection logs")
+	fs.BoolVar(&showVersion, "version", false, "print version information and exit")
 
 	fs.Usage = func() {
 		printProxyHelp(stderr, fs)
@@ -137,6 +154,14 @@ func runProxyCLI(args []string, stderr io.Writer) int {
 			return 0
 		}
 		return 2
+	}
+
+	if showVersion {
+		fmt.Fprintf(stdout, "version=%s\n", buildinfo.Version)
+		fmt.Fprintf(stdout, "commit=%s\n", buildinfo.Commit)
+		fmt.Fprintf(stdout, "go=%s\n", runtime.Version())
+		fmt.Fprintf(stdout, "os/arch=%s/%s\n", runtime.GOOS, runtime.GOARCH)
+		return 0
 	}
 
 	if listenStr == "" || targetStr == "" {
@@ -172,6 +197,8 @@ func runProxyCLI(args []string, stderr io.Writer) int {
 
 	dialer := &transport.DirectDialer{Timeout: dialTO}
 
+	log := logging.New(stderr)
+
 	cfg := proxy.ServerConfig{
 		ListenNetwork:    listenEP.Network,
 		ListenAddress:    listenEP.Address,
@@ -191,13 +218,28 @@ func runProxyCLI(args []string, stderr io.Writer) int {
 					fmt.Fprintf(stderr, "dial %s failed: %v\n", targetEP.Raw, e.Result.Err)
 				}
 				if verbose {
-					fmt.Fprintf(stderr, "event=closed connection_id=%d source=%s reason=%s s2t=%d t2s=%d elapsed_ms=%d\n",
-						e.ID, e.Source, e.Reason, e.Result.SourceToTarget, e.Result.TargetToSource, e.Result.Duration.Milliseconds())
+					fields := []string{
+						"connection_id", strconv.FormatUint(e.ID, 10),
+						"source", e.Source,
+						"reason", e.Reason,
+					}
+					if e.SessionID != "" {
+						// Omitted when absent: ordinary direct forwarding has
+						// no session (v0.3 keeps the control layer decoupled).
+						fields = append(fields, "session_id", e.SessionID)
+					}
+					fields = append(fields,
+						"s2t", logging.FormatInt(e.Result.SourceToTarget),
+						"t2s", logging.FormatInt(e.Result.TargetToSource),
+						"elapsed_ms", logging.FormatInt(e.Result.Duration.Milliseconds()))
+					log.Event("closed", fields...)
 				}
 			case "rejected":
 				if verbose {
-					fmt.Fprintf(stderr, "event=rejected connection_id=%d source=%s reason=%s\n",
-						e.ID, e.Source, e.Reason)
+					log.Event("rejected",
+						"connection_id", strconv.FormatUint(e.ID, 10),
+						"source", e.Source,
+						"reason", e.Reason)
 				}
 			}
 		},

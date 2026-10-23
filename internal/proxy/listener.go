@@ -27,7 +27,11 @@ type Event struct {
 	ID            uint64
 	Event, Reason string
 	Source        string
-	Result        Result
+	// SessionID identifies the control session when one exists; ordinary
+	// direct forwarding has no session and leaves it empty. Loggers emit
+	// session_id only when non-empty (plan §5: "session_id（若有）").
+	SessionID string
+	Result    Result
 }
 
 type accepted struct {
