@@ -34,8 +34,10 @@ jobs:
         run: go vet ./...
       - name: Race and integration tests
         run: TCP2SOCKET_TEST_RACE=1 go test -race -timeout 180s ./...
-      - name: Fuzz SOCKS request parser
-        run: go test ./internal/socks5 -run '^$' -fuzz '^FuzzReadRequest$' -fuzztime 5s -parallel 2
+      - name: Fuzz protocol parsers
+        run: |
+          go test ./internal/socks5 -run '^$' -fuzz '^FuzzReadRequest$' -fuzztime 5s -parallel 2
+          go test ./internal/control -run '^$' -fuzz '^FuzzDecodeFrame$' -fuzztime 10s -parallel 2
       - name: Build release targets
         shell: bash
         run: |
