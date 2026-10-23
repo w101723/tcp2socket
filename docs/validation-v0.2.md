@@ -37,7 +37,9 @@ The benchmark `go test ./internal/proxy -run '^$' -bench '^BenchmarkRelay$' -ben
 
 The first end-to-end run correctly caught that closing inherited blocking stdin did not interrupt macOS reads. The adapter now duplicates/registers file descriptors with Go's poller before copying. Final full standard and race runs passed after that fix. The test process helper also uses completion broadcasts so repeated cleanup cannot consume a result twice and deadlock.
 
-Writing the stress tests surfaced a wrong expectation worth recording: proxy mode is a long-running service, so it keeps accepting after all client streams close and must be stopped by signal — this matches legacy behavior, and the tests now stop it with SIGTERM and assert a bounded exit. The FD leak check is currently a no-op on macOS test hosts (`/dev/fd` and `/proc/self/fd` unavailable to the test binary); it activates on Linux hosts where that interface is readable.
+Writing the stress tests surfaced a wrong expectation worth recording: proxy mode is a long-running service, so it keeps accepting after all client streams close and must be stopped by signal — this matches legacy behavior, and the tests now stop it with SIGTERM and assert a bounded exit.
+
+Resource sampling targets the proxy subprocess, not the test parent: `/proc/<pid>/fd` on Linux or `lsof -p` on macOS, with peak-after-traffic compared against the idle level. This run sampled the subprocess on macOS via `lsof` (6 descriptors idle, stable after traffic). The parent-process goroutine check from earlier revisions was removed as unrepresentative. CI run 39891982920 (2026-10-23) passed all four matrix cells: Ubuntu Go 1.22/stable and macOS 15 Go 1.22 / macOS latest Go stable; stress tests and the subprocess-resource test were not present in that run and have only been executed locally.
 
 ## Compatibility and resource impact
 
@@ -53,4 +55,4 @@ CI first ran on the pushed `dev` commit d9db1c2 (workflow run 39889259425): Ubun
 
 New CI defines macOS/Linux Go 1.22 and stable runtime/race checks. Locally verified here: macOS arm64 runtime and test execution. Remotely observed as passing: Ubuntu Go 1.22/stable and macOS stable. Not yet verified: the re-pinned macOS 15 + Go 1.22 cell and linux/amd64 runtime; four-target cross-compilation is not runtime acceptance.
 
-No 64-connection stress run, long-duration FD/goroutine soak, 24h/72h soak or hostile-directory TOCTOU proof is claimed. The FD-leak check needs a Linux host to report real numbers. Session/Mux, doctor/version CLI, local IPC, standalone SOCKS, authorized SSH backend and experimental PTY remain future stages. No license is selected on the owner's behalf.
+No 64-connection stress run, long-duration FD/goroutine soak, 24h/72h soak or hostile-directory TOCTOU proof is claimed. The subprocess FD sampling has not yet run on a Linux CI host. Session/Mux, doctor/version CLI, local IPC, standalone SOCKS, authorized SSH backend and experimental PTY remain future stages. No license is selected on the owner's behalf.

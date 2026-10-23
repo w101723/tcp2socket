@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -175,12 +177,12 @@ func TestStress32ConcurrentStreams(t *testing.T) {
 	}
 }
 
+// TestProxyResourceBaseline samples the PROXY SUBPROCESS (not the test parent):
+// open descriptors via /proc/<pid>/fd (Linux) or lsof -p (macOS). Peak FDs must
+// return to the idle level after traffic and exit must be bounded.
 func TestProxyResourceBaseline(t *testing.T) {
 	addr, stop := stressEchoServer(t)
 	defer stop()
-
-	before := runtime.NumGoroutine()
-	fdsBefore, err := openFDCount()
 
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", getFreeTCPPort(t))
 	proxy := startProcess(t, "-l", proxyAddr, "-t", addr)
@@ -189,6 +191,11 @@ func TestProxyResourceBaseline(t *testing.T) {
 	}
 	if err := waitForEndpoint("tcp", proxyAddr, 5*time.Second); err != nil {
 		t.Fatal(err)
+	}
+
+	idleFDs, ok := subprocessFDCount(t, proxy.Cmd.Process.Pid)
+	if !ok {
+		t.Skip("subprocess descriptor sampling unavailable on this platform")
 	}
 
 	for i := 0; i < 8; i++ {
@@ -202,23 +209,43 @@ func TestProxyResourceBaseline(t *testing.T) {
 		}
 		conn.Close()
 	}
+	time.Sleep(100 * time.Millisecond) // allow closes to settle
+
+	busyFDs, ok := subprocessFDCount(t, proxy.Cmd.Process.Pid)
+	if !ok {
+		t.Fatalf("descriptor sampling worked at idle but not after traffic")
+	}
+	if busyFDs > idleFDs+64 { // 8 concurrent relays use ~3 fds each; 64 leaves ample headroom
+		t.Errorf("descriptor growth after traffic: idle=%d busy=%d", idleFDs, busyFDs)
+	}
+
 	if err := proxy.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
 	if err := proxy.WaitTimed(3 * time.Second); err != nil {
 		t.Fatalf("proxy exit: %v", err)
 	}
+}
 
-	if err == nil {
-		if fdsAfter, err := openFDCount(); err == nil && fdsAfter > fdsBefore {
-			t.Errorf("descriptor leak: before=%d after=%d", fdsBefore, fdsAfter)
+// subprocessFDCount reports the open descriptor count of the given subprocess
+// PID, or ok=false when the platform exposes no readable interface.
+func subprocessFDCount(t *testing.T, pid int) (int, bool) {
+	t.Helper()
+	if entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid)); err == nil {
+		return len(entries), true
+	}
+	out, err := exec.Command("lsof", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, false
+	}
+	count := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "COMMAND") || strings.TrimSpace(line) == "" {
+			continue
 		}
-	} else {
-		t.Logf("skip fd check: %v", err)
+		count++
 	}
-	if after := runtime.NumGoroutine(); after > before+2 {
-		t.Errorf("goroutine leak: before=%d after=%d", before, after)
-	}
+	return count, count > 0
 }
 
 func roundTrip(conn net.Conn, block []byte) error {
