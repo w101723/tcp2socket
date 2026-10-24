@@ -447,3 +447,141 @@ func TestHeartbeatMissedCounterRace(t *testing.T) {
 	}
 	<-done
 }
+
+// failingWriter fails on the nth write and counts every attempt, so a test can
+// prove no frame is attempted after a terminal write error.
+type failingWriter struct {
+	mu     sync.Mutex
+	failAt int
+	calls  int
+	err    error
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.calls++
+	if w.calls >= w.failAt {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+func (w *failingWriter) count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.calls
+}
+
+// TestFrameWriterStopsAfterWriteError: the writer goroutine must exit on the
+// first write error instead of draining queued frames (the pre-fix loop had a
+// `failing` flag that was never set, so it kept attempting writes).
+func TestFrameWriterStopsAfterWriteError(t *testing.T) {
+	boom := errors.New("boom")
+	fw := &failingWriter{failAt: 1, err: boom}
+	failed := make(chan error, 4)
+	writer := newFrameWriter(fw, func(err error) { failed <- err })
+
+	// Queue more frames than the first failure needs; all must be dropped.
+	for i := 0; i < 8; i++ {
+		_ = writer.enqueue(Frame{Type: TypePing, SessionID: testID, Sequence: uint32(i)})
+	}
+
+	select {
+	case err := <-failed:
+		if !errors.Is(err, boom) {
+			t.Fatalf("reported err = %v, want boom", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("write failure was never reported")
+	}
+	select {
+	case <-writer.done:
+	case <-time.After(time.Second):
+		t.Fatal("writer goroutine did not exit after a terminal write error")
+	}
+
+	// Give any (incorrect) draining a chance to run, then assert the count:
+	// exactly one attempt, i.e. nothing after the failure.
+	time.Sleep(50 * time.Millisecond)
+	if got := fw.count(); got != 1 {
+		t.Fatalf("write attempts = %d, want exactly 1 (no frames after failure)", got)
+	}
+	// The callback must fire once, not once per dropped frame.
+	select {
+	case err := <-failed:
+		t.Fatalf("duplicate failure report: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// After a terminal error, enqueue reports the write error, not a success.
+	if err := writer.enqueue(Frame{Type: TypePong, SessionID: testID}); !errors.Is(err, boom) {
+		t.Fatalf("enqueue after failure = %v, want boom", err)
+	}
+}
+
+// TestFrameWriterEnqueueAfterClose: once close() runs, enqueue must report
+// ErrHeartbeatClosed rather than accepting a frame the writer will never send.
+func TestFrameWriterEnqueueAfterClose(t *testing.T) {
+	fw := &failingWriter{failAt: 1 << 30}
+	writer := newFrameWriter(fw, nil)
+	writer.close()
+
+	// Wait for the goroutine to observe quit so the state is settled.
+	select {
+	case <-writer.done:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not stop on close")
+	}
+	if err := writer.enqueue(Frame{Type: TypePing, SessionID: testID}); !errors.Is(err, ErrHeartbeatClosed) {
+		t.Fatalf("enqueue after close = %v, want ErrHeartbeatClosed", err)
+	}
+	if got := fw.count(); got != 0 {
+		t.Fatalf("wrote %d frame(s) after close, want 0", got)
+	}
+}
+
+// TestFrameWriterEnqueueRacesClose: enqueue must never report success for a
+// frame that close() has already made unsendable. Every enqueue that returns
+// nil must be matched by a frame the writer actually attempted (or that was
+// accepted before the close took effect); an enqueue returning nil while
+// zero frames are written would be the pre-fix check/enqueue gap.
+func TestFrameWriterEnqueueRacesClose(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		fw := &failingWriter{failAt: 1 << 30}
+		writer := newFrameWriter(fw, nil)
+
+		accepted := make(chan int, 64)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 64; i++ {
+				if writer.enqueue(Frame{Type: TypePing, SessionID: testID, Sequence: uint32(i)}) == nil {
+					accepted <- 1
+				}
+			}
+			close(accepted)
+		}()
+
+		time.Sleep(time.Duration(round%5) * 100 * time.Microsecond)
+		writer.close()
+		wg.Wait()
+
+		var acceptedCount int
+		for range accepted {
+			acceptedCount++
+		}
+		written := fw.count()
+		// The writer may have written fewer than were accepted (it stops on
+		// close), but it must never have written more than were accepted.
+		if written > acceptedCount {
+			t.Fatalf("round %d: wrote %d frames but only %d enqueues succeeded", round, written, acceptedCount)
+		}
+		select {
+		case <-writer.done:
+		case <-time.After(time.Second):
+			t.Fatalf("round %d: writer did not stop", round)
+		}
+	}
+}

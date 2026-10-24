@@ -126,6 +126,16 @@ Emission remains outside the lock (observers must be able to re-enter), so under
 
 Evidence (macOS 27.0.1 arm64, Go 1.26.1): `go test -race -count=2 ./internal/session ./internal/control` PASS; `gofmt -l` / `go vet` clean; full matrix re-run recorded in the gate checklist.
 
+## Post-review writer closure (2026-10-24)
+
+A follow-up review of `frameWriter` found its `failing` flag was never set — the loop kept draining queued frames after a terminal write error — and that `enqueue`'s close check raced acceptance. Both are fixed; no behavior change when the stream is healthy.
+
+- **Terminal write error stops the writer**: on the first `WriteFrame` error the goroutine records the error, fires `onFail` once and returns, instead of continuing to attempt queued frames against a broken stream. `enqueue` afterwards reports the write error, never success.
+- **enqueue/close race closed**: the terminal-state check and queue acceptance now happen under the same lock (fast path); the slow path (queue full) re-validates the terminal state after waiting, so a close during the wait can never be reported as a successful send. A frame accepted before close may still be dropped by the writer — callers learn via the error state, not a false success.
+- Regression tests: `TestFrameWriterStopsAfterWriteError` (exactly one write attempt, single failure report, goroutine exits, subsequent enqueue reports the error; validated against the re-injected pre-fix drain behavior), `TestFrameWriterEnqueueAfterClose` (no writes after close), `TestFrameWriterEnqueueRacesClose` (50 rounds: never more writes than successful enqueues).
+
+Evidence (macOS 27.0.1 arm64, Go 1.26.1): `go test -race -count=10 ./internal/control` PASS; `go test -race -count=3 ./internal/session` PASS; `TCP2SOCKET_TEST_RACE=1 go test -race ./...` PASS; `go vet` clean; matrix CI re-run recorded in the gate checklist.
+
 ## Runtime integration status (read before assuming behavior)
 
 The v0.3 control layer is a **foundation layer and is not wired into the forwarding paths**. Concretely:
@@ -174,7 +184,8 @@ Resource observability: `TestProxyResourceBaseline` samples the proxy **subproce
 - [x] PR-05C heartbeat + degraded handling tests
 - [x] PR-05D doctor/version CLI + stable event logs
 - [x] Post-review concurrency closure (session timestamp race, heartbeat missed-counter race, WriteFrame short writes, event ordering contract)
-- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577) and the concurrency-closure commit `684efaa` (run 39915280343)
+- [x] Post-review writer closure (frameWriter stops after terminal write error; enqueue/close race closed)
+- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577), the concurrency-closure commit `684efaa` (run 39915280343), and the writer-closure commit (confirmed after push)
 - [x] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
 
 Deferred to later stages per plan: v0.4 Mux design, v0.5 SOCKS listener/SSH transport, experimental PTY. The control layer remains decoupled from ordinary TCP forwarding.

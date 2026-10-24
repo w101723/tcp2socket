@@ -72,27 +72,24 @@ func newFrameWriter(w io.Writer, onFail func(error)) *frameWriter {
 
 func (fw *frameWriter) run() {
 	defer close(fw.done)
-	failing := false
 	for {
 		select {
 		case <-fw.quit:
 			return
 		case f := <-fw.ch:
-			if failing {
-				continue // frames are worthless once the stream errored
-			}
 			if err := WriteFrame(fw.w, f); err != nil {
+				werr := fmt.Errorf("control write: %w", err)
 				fw.mu.Lock()
-				if fw.writeErr == nil {
-					fw.writeErr = fmt.Errorf("control write: %w", err)
-					cb := fw.onFail
-					fw.mu.Unlock()
-					if cb != nil {
-						cb(fw.writeErr)
-					}
-				} else {
-					fw.mu.Unlock()
+				fw.writeErr = werr
+				cb := fw.onFail
+				fw.mu.Unlock()
+				if cb != nil {
+					cb(werr)
 				}
+				// A write error is terminal for the stream: return instead of
+				// draining the queue, so no later frame is attempted on a
+				// broken writer and callers learn via the error state.
+				return
 			}
 		}
 	}
@@ -100,27 +97,44 @@ func (fw *frameWriter) run() {
 
 func (fw *frameWriter) enqueue(f Frame) error {
 	fw.mu.Lock()
-	if fw.closed {
-		err := fw.callerErr()
+	if err := fw.terminalErrLocked(); err != nil {
 		fw.mu.Unlock()
 		return err
 	}
-	fw.mu.Unlock()
+	// Fast path: accept under the lock, so a concurrent close() cannot
+	// interleave between the state check and acceptance and make a frame
+	// look accepted after shutdown.
 	select {
 	case fw.ch <- f:
+		fw.mu.Unlock()
 		return nil
-	case <-fw.done:
-		fw.mu.Lock()
-		defer fw.mu.Unlock()
-		return fw.callerErr()
+	default:
 	}
+	fw.mu.Unlock()
+
+	// Slow path (queue full): wait for room, the writer to end, or shutdown,
+	// then re-check the terminal state so a close during the wait is never
+	// reported as a successful send.
+	select {
+	case fw.ch <- f:
+	case <-fw.quit:
+	case <-fw.done:
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	return fw.terminalErrLocked()
 }
 
-func (fw *frameWriter) callerErr() error {
+// terminalErrLocked reports the writer's terminal state; nil means frames may
+// still be accepted. Callers must hold fw.mu.
+func (fw *frameWriter) terminalErrLocked() error {
 	if fw.writeErr != nil {
 		return fw.writeErr
 	}
-	return ErrHeartbeatClosed
+	if fw.closed {
+		return ErrHeartbeatClosed
+	}
+	return nil
 }
 
 // close stops accepting frames and ends the writer goroutine. It does not
