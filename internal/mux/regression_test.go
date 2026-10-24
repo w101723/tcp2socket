@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -141,7 +142,9 @@ func TestWriteSequenceStableAcrossQueueFull(t *testing.T) {
 			t.Fatalf("write with retries: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("write never completed after release")
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("write never completed after release\n%s", buf[:n])
 	}
 	select {
 	case got := <-gotCh:
