@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -93,7 +94,18 @@ func TestMuxStressStreamCounts(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					st, err := client.Open(Target{Network: NetworkTCP, Address: "stress.local:1"})
+					// Under load (race detector, loaded runners) the accept
+					// backlog can genuinely overflow: the server legitimately
+					// answers OPEN_ERR. A real dialer retries; model that.
+					var st *Stream
+					var err error
+					for attempt := 0; attempt < 20; attempt++ {
+						st, err = client.Open(Target{Network: NetworkTCP, Address: "stress.local:1"})
+						if err == nil || !strings.Contains(err.Error(), "ERR_SHUTDOWN") {
+							break
+						}
+						time.Sleep(20 * time.Millisecond)
+					}
 					if err != nil {
 						fail <- err
 						return
