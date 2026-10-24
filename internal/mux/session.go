@@ -699,8 +699,11 @@ func (st *Stream) consumed(n int) {
 		if !errors.Is(err, ErrQueueFull) {
 			return // scheduler closed: the session is ending anyway
 		}
-		// control queue full (writer stalled): park until it drains; the
-		// update itself must never be dropped or the peer's window freezes
+		// control queue full (writer stalled): re-arm the writer's wakeup
+		// (another parked producer may have consumed the token), then park;
+		// the update itself must never be dropped or the peer's window
+		// freezes
+		st.session.sched.Poke()
 		select {
 		case <-st.session.sched.Ready():
 		case <-st.dead:
@@ -790,7 +793,9 @@ func (st *Stream) Write(p []byte) (int, error) {
 			}
 			// ErrQueueFull: the transport is slower than this producer;
 			// park until the writer drains a slot (bounded queue depth,
-			// never unbounded buffering).
+			// never unbounded buffering). Poke first: a parked sibling
+			// producer may hold the only token (token-theft deadlock).
+			st.session.sched.Poke()
 			select {
 			case <-st.session.sched.Ready():
 			case <-st.dead:

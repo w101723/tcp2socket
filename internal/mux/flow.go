@@ -413,6 +413,14 @@ func (s *Scheduler) signalReady() {
 // scheduler closes); the writer goroutine blocks on it instead of spinning.
 func (s *Scheduler) Ready() <-chan struct{} { return s.ready }
 
+// Poke re-arms the Ready token. Producers parked on a FULL queue must Poke
+// after each failed enqueue: the sole token may have been consumed by
+// another parked producer rather than the writer, and without a re-signal
+// the writer sleeps forever while queues hold frames (the token-theft
+// deadlock the CI dump caught: server consumed() stole the token, the
+// writer parked, control stayed full, the session froze).
+func (s *Scheduler) Poke() { s.signalReady() }
+
 // Close stops new enqueues. Queued frames may still be drained.
 func (s *Scheduler) Close() {
 	s.mu.Lock()
