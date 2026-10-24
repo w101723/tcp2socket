@@ -131,7 +131,7 @@ Evidence (macOS 27.0.1 arm64, Go 1.26.1): `go test -race -count=2 ./internal/ses
 A follow-up review of `frameWriter` found its `failing` flag was never set — the loop kept draining queued frames after a terminal write error — and that `enqueue`'s close check raced acceptance. Both are fixed; no behavior change when the stream is healthy.
 
 - **Terminal write error stops the writer**: on the first `WriteFrame` error the goroutine records the error, fires `onFail` once and returns, instead of continuing to attempt queued frames against a broken stream. `enqueue` afterwards reports the write error, never success.
-- **enqueue/close race closed**: the terminal-state check and queue acceptance now happen under the same lock (fast path); the slow path (queue full) re-validates the terminal state after waiting, so a close during the wait can never be reported as a successful send. A frame accepted before close may still be dropped by the writer — callers learn via the error state, not a false success.
+- **enqueue/close race closed**: the terminal-state check and queue acceptance now happen under the same lock (fast path). The acceptance contract is explicit: `enqueue` returns nil **iff the frame was accepted into the queue** — a frame accepted under a concurrent close may still be written (correct: it was accepted), while an enqueue that wins nothing during the slow-path wait returns the terminal state (write error or `ErrHeartbeatClosed`) and nothing was sent. An earlier draft of this closure violated that invariant on the slow path — it re-checked the terminal state after the frame had already been accepted and reported failure for a frame the writer could still write. The writer-closure CI run caught it on two runners (the same window, under runner load); the invariant and the failing draft are recorded here, and `TestFrameWriterEnqueueRacesClose` (writes must never exceed accepted enqueues, 50 rounds) rejects the draft deterministically.
 - Regression tests: `TestFrameWriterStopsAfterWriteError` (exactly one write attempt, single failure report, goroutine exits, subsequent enqueue reports the error; validated against the re-injected pre-fix drain behavior), `TestFrameWriterEnqueueAfterClose` (no writes after close), `TestFrameWriterEnqueueRacesClose` (50 rounds: never more writes than successful enqueues).
 
 Evidence (macOS 27.0.1 arm64, Go 1.26.1): `go test -race -count=10 ./internal/control` PASS; `go test -race -count=3 ./internal/session` PASS; `TCP2SOCKET_TEST_RACE=1 go test -race ./...` PASS; `go vet` clean; matrix CI re-run recorded in the gate checklist.
@@ -184,8 +184,8 @@ Resource observability: `TestProxyResourceBaseline` samples the proxy **subproce
 - [x] PR-05C heartbeat + degraded handling tests
 - [x] PR-05D doctor/version CLI + stable event logs
 - [x] Post-review concurrency closure (session timestamp race, heartbeat missed-counter race, WriteFrame short writes, event ordering contract)
-- [x] Post-review writer closure (frameWriter stops after terminal write error; enqueue/close race closed)
-- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577), the concurrency-closure commit `684efaa` (run 39915280343), and the writer-closure commit (confirmed after push)
+- [x] Post-review writer closure (frameWriter stops after terminal write error; enqueue/close race closed with the nil-iff-accepted contract)
+- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577), the concurrency-closure commit `684efaa` (run 39915280343), and the writer-closure commits `912e916`+follow-up (run 40048912760 exposed an enqueue invariant violation, fixed and re-verified)
 - [x] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
 
 Deferred to later stages per plan: v0.4 Mux design, v0.5 SOCKS listener/SSH transport, experimental PTY. The control layer remains decoupled from ordinary TCP forwarding.

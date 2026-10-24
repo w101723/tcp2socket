@@ -102,8 +102,7 @@ func (fw *frameWriter) enqueue(f Frame) error {
 		return err
 	}
 	// Fast path: accept under the lock, so a concurrent close() cannot
-	// interleave between the state check and acceptance and make a frame
-	// look accepted after shutdown.
+	// interleave between the state check and acceptance.
 	select {
 	case fw.ch <- f:
 		fw.mu.Unlock()
@@ -112,11 +111,15 @@ func (fw *frameWriter) enqueue(f Frame) error {
 	}
 	fw.mu.Unlock()
 
-	// Slow path (queue full): wait for room, the writer to end, or shutdown,
-	// then re-check the terminal state so a close during the wait is never
-	// reported as a successful send.
+	// Slow path (queue full): wait for room, shutdown, or the writer to end.
+	// The contract is nil <=> the frame was accepted into the queue: if the
+	// send wins the select, the frame may still be written even under a
+	// concurrent close, so it must not be reported as failed. An error is
+	// returned only when nothing was accepted; in that case the terminal
+	// state (write error or ErrHeartbeatClosed) explains why.
 	select {
 	case fw.ch <- f:
+		return nil
 	case <-fw.quit:
 	case <-fw.done:
 	}
