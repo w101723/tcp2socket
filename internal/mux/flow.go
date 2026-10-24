@@ -98,18 +98,19 @@ func (c *SendCredit) Close() {
 // parks until any stream's consumer frees budget); only actual window
 // violations RESET a stream, never a busy session.
 type SessionBuffer struct {
-	mu    sync.Mutex
-	used  int64
-	max   int64
-	wake  chan struct{}
-	woken bool
+	mu       sync.Mutex
+	used     int64
+	byStream map[uint32]int64 // reserved bytes per stream, freed on stream death
+	max      int64
+	wake     chan struct{}
+	woken    bool
 }
 
 func NewSessionBuffer(max int64) *SessionBuffer {
 	if max <= 0 {
 		max = MaxSessionBuffer
 	}
-	return &SessionBuffer{max: max, wake: make(chan struct{})}
+	return &SessionBuffer{max: max, wake: make(chan struct{}), byStream: make(map[uint32]int64)}
 }
 
 var ErrSessionBufferFull = errors.New("mux session receive buffer exhausted")
@@ -122,6 +123,7 @@ func (b *SessionBuffer) Reserve(id uint32, n int) error {
 		return ErrSessionBufferFull
 	}
 	b.used += int64(n)
+	b.byStream[id] += int64(n)
 	return nil
 }
 
@@ -129,7 +131,13 @@ func (b *SessionBuffer) Reserve(id uint32, n int) error {
 // is shared, so any stream's release may unblock any other).
 func (b *SessionBuffer) Release(id uint32, n int) {
 	b.mu.Lock()
-	b.used -= int64(n)
+	if n > 0 {
+		b.used -= int64(n)
+		b.byStream[id] -= int64(n)
+		if b.byStream[id] <= 0 {
+			delete(b.byStream, id)
+		}
+	}
 	if b.used < 0 {
 		b.used = 0
 	}
@@ -137,6 +145,27 @@ func (b *SessionBuffer) Release(id uint32, n int) {
 		b.woken = false
 		close(b.wake)
 		b.wake = make(chan struct{})
+	}
+	b.mu.Unlock()
+}
+
+// ReleaseStream drops every reservation held by stream id. Called when the
+// stream dies with data still sitting in its receive queue that no
+// application will ever consume: without this the session-wide budget
+// leaks one delivered frame per dead stream until the reader wedges.
+func (b *SessionBuffer) ReleaseStream(id uint32) {
+	b.mu.Lock()
+	if held := b.byStream[id]; held > 0 {
+		b.used -= held
+		if b.used < 0 {
+			b.used = 0
+		}
+		delete(b.byStream, id)
+		if b.woken {
+			b.woken = false
+			close(b.wake)
+			b.wake = make(chan struct{})
+		}
 	}
 	b.mu.Unlock()
 }

@@ -56,6 +56,10 @@ var (
 type stream struct {
 	id    uint32
 	state StreamState
+	// finSent is a dedicated flag (not derived from state): registry Close
+	// also lands in StreamClosed, and Close() must not mistake a RESET-
+	// closed stream for one whose FIN already went out.
+	finSent bool
 
 	mu sync.Mutex
 	// receive credit: bytes the peer may still send us
@@ -186,6 +190,19 @@ func (r *Registry) State(id uint32) (StreamState, error) {
 	return s.state, nil
 }
 
+// FinSent reports whether we already sent FIN on the stream. Close()
+// consults it: after our FIN the peer already has everything we wrote, so
+// Close must stay silent on the wire instead of answering with a RESET.
+func (r *Registry) FinSent(id uint32) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.streams[id]
+	if !ok {
+		return false
+	}
+	return s.finSent
+}
+
 // LocalFin records that we sent FIN on the stream (half-close local).
 func (r *Registry) LocalFin(id uint32) error {
 	r.mu.Lock()
@@ -197,9 +214,11 @@ func (r *Registry) LocalFin(id uint32) error {
 	switch s.state {
 	case StreamOpen:
 		s.state = StreamHalfClosedLocal
+		s.finSent = true
 		return nil
 	case StreamHalfClosedRemote:
 		s.state = StreamClosed
+		s.finSent = true
 		return nil
 	default:
 		return fmt.Errorf("%w in state %s", ErrDuplicateFin, s.state)

@@ -341,6 +341,18 @@ func (s *Session) handleOpen(f Frame) error {
 	// v1 accepts structurally valid opens unconditionally; the dialer
 	// wiring in the CLI integration layer owns target policy and will
 	// convert this into per-target OPEN_ERR decisions.
+	//
+	// Hand the stream to the application BEFORE answering: on accept-backlog
+	// overflow the peer must receive OPEN_ERR only — never an OPEN_OK
+	// followed by a drop (a lying OK invites in-flight DATA onto a stream
+	// this side already closed).
+	select {
+	case s.acceptCh <- st:
+	default:
+		s.dropStream(f.StreamID)
+		payload, _ := ErrorPayload{Code: ErrCodeShutdown, Detail: "accept backlog full"}.Encode()
+		return s.sched.Enqueue(Frame{Type: TypeOpenErr, Epoch: s.epoch, StreamID: f.StreamID, Payload: payload})
+	}
 	if err := s.sched.Enqueue(Frame{Type: TypeOpenOk, Epoch: s.epoch, StreamID: f.StreamID}); err != nil {
 		s.dropStream(f.StreamID)
 		payload, _ := ErrorPayload{Code: ErrCodeShutdown, Detail: "session shutting down"}.Encode()
@@ -348,18 +360,7 @@ func (s *Session) handleOpen(f Frame) error {
 		return nil
 	}
 	st.openResolved(nil)
-
-	// Hand the stream to the application without blocking the reader: a
-	// slow accept loop must not wedge the session. Overflow closes the
-	// stream politely.
-	select {
-	case s.acceptCh <- st:
-		return nil
-	default:
-		s.dropStream(f.StreamID)
-		payload, _ := ErrorPayload{Code: ErrCodeShutdown, Detail: "accept backlog full"}.Encode()
-		return s.sched.Enqueue(Frame{Type: TypeOpenErr, Epoch: s.epoch, StreamID: f.StreamID, Payload: payload})
-	}
+	return nil
 }
 
 func (s *Session) handleData(f Frame) error {
@@ -396,7 +397,11 @@ func (s *Session) handleData(f Frame) error {
 	}
 	if err := st.deliver(f.Payload); err != nil {
 		if errors.Is(err, ErrStreamClosed) {
-			return nil // stream died while delivering: already failed locally
+			// stream died while delivering: nobody will ever consume these
+			// bytes, so the reservation must go back or the session budget
+			// leaks one frame per dead stream
+			s.bufBudget.Release(f.StreamID, len(f.Payload))
+			return nil
 		}
 		return s.resetStream(f.StreamID, ErrCodeFlowControl, err.Error())
 	}
@@ -521,6 +526,7 @@ func (s *Session) dropStream(id uint32) {
 	delete(s.streams, id)
 	s.mu.Unlock()
 	_ = s.reg.Close(id)
+	s.bufBudget.ReleaseStream(id) // unconsumed delivered data must not leak the session budget
 	s.sched.RemoveStream(id)
 }
 
@@ -599,10 +605,13 @@ func (st *Stream) Target() Target { return st.target }
 
 // Read blocks for peer data. Returns io.EOF after the peer's FIN with all
 // data drained; returns the stream error if the stream/session died.
-// The receive cursor consumes each buffered block possibly across several
-// Read calls, so every delivered byte is released and window-updated
-// exactly once. Read is single-consumer; the EOF channel is closed at most
-// once (frames are processed in order, so FIN never races ahead of DATA).
+// Every copied byte is consumed exactly once at the moment it is copied:
+// a block split across several Read calls releases its budget in parts
+// (a whole-block release at the tail would strand the earlier partial
+// copies and leak the session budget). Multiple small WINDOW_UPDATEs per
+// block are protocol-legal. Read is single-consumer; the EOF channel is
+// closed at most once (frames are processed in order, so FIN never races
+// ahead of DATA).
 func (st *Stream) Read(p []byte) (int, error) {
 	for {
 		// 1. continue the current block
@@ -618,22 +627,16 @@ func (st *Stream) Read(p []byte) (int, error) {
 		select {
 		case b := <-st.recv:
 			n := copy(p, b)
-			if n < len(b) {
-				st.recvCur = b[n:] // tail consumed by later Read calls
-			} else {
-				st.consumed(n)
-			}
+			st.recvCur = b[n:]
+			st.consumed(n)
 			return n, nil
 		default:
 		}
 		select {
 		case b := <-st.recv:
 			n := copy(p, b)
-			if n < len(b) {
-				st.recvCur = b[n:]
-			} else {
-				st.consumed(n)
-			}
+			st.recvCur = b[n:]
+			st.consumed(n)
 			return n, nil
 		case <-st.recvEOF:
 			if len(st.recv) > 0 { // in-flight blocks beat the EOF marker
@@ -819,9 +822,12 @@ func (st *Stream) Close() error {
 
 	// A stream already terminated by the peer (RESET received or transport
 	// failure) is CLOSED per §7.2: answering a RESET with another RESET is
-	// protocol noise that can race the peer's still-draining reads. Only a
-	// locally-initiated close of a live stream announces a RESET.
-	if st.peerTerminated() {
+	// protocol noise that can race the peer's still-draining reads. The same
+	// applies after our own FIN (half-closed local): the peer already has
+	// everything we wrote — like TCP close() after shutdown(SHUT_WR), Close
+	// stays silent on the wire. Only a locally-initiated close of a live
+	// stream announces a RESET.
+	if st.peerTerminated() || st.session.reg.FinSent(st.id) {
 		return nil
 	}
 	payload, _ := ErrorPayload{Code: ErrCodeShutdown, Detail: "stream closed locally"}.Encode()
