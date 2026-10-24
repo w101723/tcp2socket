@@ -161,15 +161,21 @@ func TestSchedulerBoundedQueues(t *testing.T) {
 	}
 }
 
-// TestSchedulerRemoveAndClose: removed streams vanish from the ring; close
-// drains then reports terminal.
+// TestSchedulerRemoveAndClose: a retired stream's queued frames are still
+// flushed in order (Write-must-not-lose-data); close drains then reports
+// terminal.
 func TestSchedulerRemoveAndClose(t *testing.T) {
 	s := NewScheduler()
 	_ = s.Enqueue(Frame{Type: TypeData, StreamID: 1, Sequence: 1})
 	s.RemoveStream(1)
+	// retired queue drains before the scheduler reports empty
 	f, err := s.Next()
+	if err != nil || f.StreamID != 1 {
+		t.Fatalf("retired queue must still flush: %+v %v", f, err)
+	}
+	f, err = s.Next()
 	if err != nil || f.Type != 0 {
-		t.Fatalf("after remove: %+v %v", f, err)
+		t.Fatalf("after drain: %+v %v", f, err)
 	}
 	_ = s.Enqueue(Frame{Type: TypeData, StreamID: 3, Sequence: 1})
 	s.Close()

@@ -304,19 +304,18 @@ func (r *Registry) CheckWindowUpdate(id uint32, seq uint32) error {
 	return nil
 }
 
-// Consume records that the application read n buffered bytes, freeing
-// receive-side buffer; the caller turns that into a WINDOW_UPDATE.
-func (r *Registry) Consume(id uint32, n int) error {
+// GrowReceiveWindow returns n consumed bytes to the stream's receive
+// credit after the application read them; the caller announces this to the
+// peer with a WINDOW_UPDATE. This is the same ledger CheckData deducts
+// from — the single authority on receive credit.
+func (r *Registry) GrowReceiveWindow(id uint32, n int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s, ok := r.streams[id]
 	if !ok {
 		return fmt.Errorf("%w: %d", ErrGhostStream, id)
 	}
-	s.buffered -= n
-	if s.buffered < 0 {
-		s.buffered = 0
-	}
+	s.recvWindow += n
 	return nil
 }
 

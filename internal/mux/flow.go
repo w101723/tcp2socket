@@ -94,27 +94,27 @@ func (c *SendCredit) Close() {
 }
 
 // SessionBuffer bounds the aggregate receive memory across streams (§5):
-// 1 MiB total. A stream that keeps filling while its consumer does not
-// read is the violator; the scheduler RESETs it, not the session.
+// 1 MiB total. Exhaustion applies session-wide backpressure (the reader
+// parks until any stream's consumer frees budget); only actual window
+// violations RESET a stream, never a busy session.
 type SessionBuffer struct {
-	mu      sync.Mutex
-	used    int64
-	max     int64
-	perWait map[uint32]chan struct{}
+	mu    sync.Mutex
+	used  int64
+	max   int64
+	wake  chan struct{}
+	woken bool
 }
 
 func NewSessionBuffer(max int64) *SessionBuffer {
 	if max <= 0 {
 		max = MaxSessionBuffer
 	}
-	return &SessionBuffer{max: max, perWait: make(map[uint32]chan struct{})}
+	return &SessionBuffer{max: max, wake: make(chan struct{})}
 }
 
 var ErrSessionBufferFull = errors.New("mux session receive buffer exhausted")
 
-// Reserve books n bytes for stream id. It fails when the aggregate limit
-// would be exceeded, naming the caller so the session can apply backpressure
-// to exactly that stream.
+// Reserve books n bytes for stream id.
 func (b *SessionBuffer) Reserve(id uint32, n int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -125,32 +125,28 @@ func (b *SessionBuffer) Reserve(id uint32, n int) error {
 	return nil
 }
 
-// Release returns booked bytes (application read them).
+// Release returns booked bytes and wakes every parked reserver (the budget
+// is shared, so any stream's release may unblock any other).
 func (b *SessionBuffer) Release(id uint32, n int) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.used -= int64(n)
 	if b.used < 0 {
 		b.used = 0
 	}
-	if ch, ok := b.perWait[id]; ok {
-		delete(b.perWait, id)
-		close(ch)
+	if b.woken {
+		b.woken = false
+		close(b.wake)
+		b.wake = make(chan struct{})
 	}
+	b.mu.Unlock()
 }
 
-// WaitBlocked parks a stream whose Reserve failed until the buffer drains
-// or the session closes. Returns false if the session is gone.
+// WaitBlocked parks until any Release fires (broadcast semantics via
+// channel replacement) or the caller gives up.
 func (b *SessionBuffer) WaitBlocked(id uint32) <-chan struct{} {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.perWait == nil {
-		b.perWait = make(map[uint32]chan struct{})
-	}
-	if _, ok := b.perWait[id]; !ok {
-		b.perWait[id] = make(chan struct{})
-	}
-	return b.perWait[id]
+	return b.wake
 }
 
 func (b *SessionBuffer) Used() int64 {
@@ -165,11 +161,13 @@ func (b *SessionBuffer) Used() int64 {
 type Scheduler struct {
 	mu      sync.Mutex
 	queues  map[uint32]chan Frame // stream_id -> outbound queue
+	retired map[uint32]chan Frame // queues kept until drained (RemoveStream)
 	control chan Frame            // session-scoped frames, priority
 	order   []uint32              // round-robin ring
 	pos     int
 	budget  int // bytes per stream per turn
 	closed  bool
+	ready   chan struct{} // signaled on first enqueue; writer blocks on it
 }
 
 const (
@@ -180,8 +178,10 @@ const (
 func NewScheduler() *Scheduler {
 	return &Scheduler{
 		queues:  make(map[uint32]chan Frame),
+		retired: make(map[uint32]chan Frame),
 		control: make(chan Frame, schedulerQueueDepth),
 		budget:  schedulerBudget,
+		ready:   make(chan struct{}, 1),
 	}
 }
 
@@ -198,6 +198,7 @@ func (s *Scheduler) EnqueueControl(f Frame) error {
 	s.mu.Unlock()
 	select {
 	case s.control <- f:
+		s.signalReady()
 		return nil
 	default:
 		return errors.New("mux control queue full")
@@ -227,6 +228,7 @@ func (s *Scheduler) Enqueue(f Frame) error {
 
 	select {
 	case q <- f:
+		s.signalReady()
 		return nil
 	default:
 		return ErrQueueFull
@@ -242,19 +244,35 @@ func containsUint32(xs []uint32, v uint32) bool {
 	return false
 }
 
-// RemoveStream drops a finished stream from the ring. Its queued frames are
-// abandoned (the stream is closed; nothing reads them anymore).
+// RemoveStream retires a finished stream: its queue stays in the ring and
+// every frame already accepted by Enqueue is still flushed in order (a
+// Write that returned nil must not lose data to a later Close — the same
+// net.Conn guarantee TCP gives). The Close RESET lands in the same queue
+// after those frames, so the peer sees DATA…, FIN-echo…, RESET in order.
+// Next() garbage-collects the retired entry once its queue drains.
 func (s *Scheduler) RemoveStream(id uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.queues, id)
-	for i, v := range s.order {
-		if v == id {
-			s.order = append(s.order[:i], s.order[i+1:]...)
-			if s.pos > i {
-				s.pos--
+	if q, ok := s.queues[id]; ok {
+		s.retired[id] = q
+	}
+}
+
+// gcRetired drops drained retired queues. Called with mu held.
+func (s *Scheduler) gcRetired() {
+	for id, q := range s.retired {
+		if len(q) == 0 {
+			delete(s.retired, id)
+			delete(s.queues, id)
+			for i, v := range s.order {
+				if v == id {
+					s.order = append(s.order[:i], s.order[i+1:]...)
+					if s.pos > i {
+						s.pos--
+					}
+					break
+				}
 			}
-			break
 		}
 	}
 }
@@ -299,10 +317,18 @@ func (s *Scheduler) Next() (Frame, error) {
 		select {
 		case f := <-q:
 			s.mu.Lock()
-			// advance past this stream; drop it from the ring when its
-			// queue is empty and closed-out (caller removes via RemoveStream)
 			s.pos = (start + i + 1) % max(len(s.order), 1)
+			more := len(q) > 0 || len(s.control) > 0
+			for _, other := range s.queues {
+				if len(other) > 0 {
+					more = true
+					break
+				}
+			}
 			s.mu.Unlock()
+			if more {
+				s.signalReady() // keep the token alive for the next iteration
+			}
 			return f, nil
 		default:
 		}
@@ -310,8 +336,10 @@ func (s *Scheduler) Next() (Frame, error) {
 	// nothing ready this turn
 	s.mu.Lock()
 	s.pos = (start + 1) % max(len(s.order), 1)
+	s.gcRetired()
+	closed := s.closed
 	s.mu.Unlock()
-	if s.closed {
+	if closed {
 		// queues empty and closed: report terminal
 		for _, id := range ring {
 			s.mu.Lock()
@@ -326,11 +354,30 @@ func (s *Scheduler) Next() (Frame, error) {
 	return Frame{}, nil
 }
 
+// signalReady must never drop a wakeup. The channel has capacity 1 and is
+// the "maybe something to do" edge; Next() consumes the token whenever it
+// successfully dequeues a frame, and re-signals when frames remain. A lost
+// wakeup parks the writer forever while queues hold frames (the deadlock
+// the session tests caught).
+func (s *Scheduler) signalReady() {
+	select {
+	case s.ready <- struct{}{}:
+		return
+	default:
+		return // token already pending; Next will re-check the queues
+	}
+}
+
+// Ready returns a channel pulsed whenever a frame becomes available (or the
+// scheduler closes); the writer goroutine blocks on it instead of spinning.
+func (s *Scheduler) Ready() <-chan struct{} { return s.ready }
+
 // Close stops new enqueues. Queued frames may still be drained.
 func (s *Scheduler) Close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.closed = true
+	s.mu.Unlock()
+	s.signalReady()
 }
 
 func (s *Scheduler) Closed() bool {

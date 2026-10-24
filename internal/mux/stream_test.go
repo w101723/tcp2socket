@@ -154,7 +154,7 @@ func TestGhostFrames(t *testing.T) {
 		{"fin", func() error { return r.RemoteFin(999) }},
 		{"close", func() error { return r.Close(999) }},
 		{"state", func() error { _, err := r.State(999); return err }},
-		{"consume", func() error { return r.Consume(999, 1) }},
+		{"grow window", func() error { return r.GrowReceiveWindow(999, 1) }},
 		{"window", func() error { return r.CheckWindowUpdate(999, 1) }},
 	} {
 		if err := check.fn(); !errors.Is(err, ErrGhostStream) {
@@ -199,7 +199,7 @@ func TestWindowEnforcement(t *testing.T) {
 		t.Fatalf("overrun must surface negative credit: %d %v", rem, err)
 	}
 	// consume and the window recovers (caller sends WINDOW_UPDATE)
-	if err := r.Consume(1, 110); err != nil {
+	if err := r.GrowReceiveWindow(1, 110); err != nil {
 		t.Fatal(err)
 	}
 }
