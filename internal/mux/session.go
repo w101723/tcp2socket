@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -577,6 +578,16 @@ type Stream struct {
 	winMu   sync.Mutex
 	winSeq  uint32
 
+	// Deadlines (net.Conn semantics): a timer resets a per-direction
+	// channel; blocked operations select on it and fail with
+	// os.ErrDeadlineExceeded. Zero time clears the deadline.
+	rdMu      sync.Mutex
+	readDead  chan struct{} // closed when the read deadline fires; replaced on reset
+	readTimer *time.Timer
+	wdMu      sync.Mutex
+	writeDead chan struct{}
+	writeTmr  *time.Timer
+
 	dead    chan struct{}
 	deadErr error
 	deadMu  sync.Mutex
@@ -618,9 +629,7 @@ func (st *Stream) Read(p []byte) (int, error) {
 		if len(st.recvCur) > 0 {
 			n := copy(p, st.recvCur)
 			st.recvCur = st.recvCur[n:]
-			if len(st.recvCur) == 0 {
-				st.consumed(n)
-			}
+			st.consumed(n)
 			return n, nil
 		}
 		// 2. take the next block; EOF only after the queue drains
@@ -657,6 +666,8 @@ func (st *Stream) Read(p []byte) (int, error) {
 				return 0, err
 			}
 			return 0, io.EOF
+		case <-st.readDeadline():
+			return 0, os.ErrDeadlineExceeded
 		}
 	}
 }
@@ -728,6 +739,8 @@ func (st *Stream) Write(p []byte) (int, error) {
 			case <-wait:
 			case <-st.dead:
 				return total - len(p), st.deadError()
+			case <-st.writeDeadline():
+				return total - len(p), os.ErrDeadlineExceeded
 			}
 			continue
 		}
@@ -739,10 +752,13 @@ func (st *Stream) Write(p []byte) (int, error) {
 			n = MaxFramePayload
 		}
 		chunk := p[:n]
+		seq := st.nextDataSeq() // burn one sequence per frame, not per retry:
+		// the receiver validates consecutive DATA sequence numbers, and a
+		// retry after ErrQueueFull must resend the SAME frame, not skip ahead
 		for {
 			err := st.session.sched.Enqueue(Frame{
 				Type: TypeData, Epoch: st.session.epoch, StreamID: st.id,
-				Sequence: st.nextDataSeq(), Payload: append([]byte(nil), chunk...),
+				Sequence: seq, Payload: append([]byte(nil), chunk...),
 			})
 			if err == nil {
 				break
@@ -759,6 +775,9 @@ func (st *Stream) Write(p []byte) (int, error) {
 			case <-st.dead:
 				st.send.Grant(uint32(n))
 				return total - len(p), st.deadError()
+			case <-st.writeDeadline():
+				st.send.Grant(uint32(n))
+				return total - len(p), os.ErrDeadlineExceeded
 			}
 		}
 		p = p[n:]
@@ -908,11 +927,68 @@ func (st *Stream) openResolved(err error) {
 
 // net.Conn compatibility (deadline stubs: the session transport owns real
 // deadlines; per-stream deadlines arrive with the v0.4 dialer wiring).
-func (st *Stream) LocalAddr() net.Addr                            { return muxAddr{} }
-func (st *Stream) RemoteAddr() net.Addr                           { return muxAddr{} }
-func (st *Stream) SetDeadline(t interface{ IsZero() bool }) error { return nil }
-func (st *Stream) SetReadDeadline(t time.Time) error              { return nil }
-func (st *Stream) SetWriteDeadline(t time.Time) error             { return nil }
+func (st *Stream) LocalAddr() net.Addr  { return muxAddr{} }
+func (st *Stream) RemoteAddr() net.Addr { return muxAddr{} }
+func (st *Stream) SetDeadline(t time.Time) error {
+	if err := st.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return st.SetWriteDeadline(t)
+}
+
+// resetDeadline arms one direction's deadline channel under mu.
+func resetDeadline(mu *sync.Mutex, ch *chan struct{}, tmr **time.Timer, t time.Time) {
+	mu.Lock()
+	defer mu.Unlock()
+	if *tmr != nil {
+		(*tmr).Stop()
+		*tmr = nil
+	}
+	if *ch != nil && !t.IsZero() {
+		select {
+		case <-*ch: // already fired: keep it closed for late observers
+		default:
+			close(*ch)
+		}
+	}
+	if t.IsZero() {
+		*ch = make(chan struct{})
+		return
+	}
+	*ch = make(chan struct{})
+	c := *ch
+	*tmr = time.AfterFunc(time.Until(t), func() { close(c) })
+}
+
+func (st *Stream) SetReadDeadline(t time.Time) error {
+	resetDeadline(&st.rdMu, &st.readDead, &st.readTimer, t)
+	return nil
+}
+
+func (st *Stream) SetWriteDeadline(t time.Time) error {
+	resetDeadline(&st.wdMu, &st.writeDead, &st.writeTmr, t)
+	return nil
+}
+
+// readDeadline returns the current read-deadline channel.
+func (st *Stream) readDeadline() <-chan struct{} {
+	st.rdMu.Lock()
+	defer st.rdMu.Unlock()
+	if st.readDead == nil {
+		st.readDead = make(chan struct{})
+	}
+	return st.readDead
+}
+
+// writeDeadline returns the current write-deadline channel.
+func (st *Stream) writeDeadline() <-chan struct{} {
+	st.wdMu.Lock()
+	defer st.wdMu.Unlock()
+	if st.writeDead == nil {
+		st.writeDead = make(chan struct{})
+	}
+	return st.writeDead
+}
 
 type muxAddr struct{}
 

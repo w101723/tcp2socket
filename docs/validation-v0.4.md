@@ -75,6 +75,18 @@ Two test-harness defects found by `-race` were also fixed (a `t.Logf` after subt
 
 Evidence: `go test -race -count=3 ./internal/mux` PASS (zero DATA RACE reports); full repo `go test -race ./...` (11 packages) PASS; `go vet` clean.
 
+## Mux correctness closure (2026-10-24 review)
+
+A static review of the PR-07 code found four boundary defects plus a non-conforming Deadline stub. All five fixed in `internal/mux/regression_test.go`-guarded form, each re-injection-verified (the pre-fix code re-applied makes its test fail deterministically):
+
+1. **P0 — `SessionBuffer.WaitBlocked` never set `woken`** (flow.go): `Release` only broadcasts when `woken` is set, so a reserver parked on budget exhaustion could sleep until the session ended. `WaitBlocked` now marks a waiter. Regression: `TestSessionBufferExhaustionWakesWaiter` (pre-fix: waiter never woken, 2s timeout).
+2. **P0 — `Stream.Write` burned DATA sequences on `ErrQueueFull` retries** (session.go): `nextDataSeq()` ran inside the enqueue retry loop; each failed attempt skipped a sequence, the receiver's consecutive-sequence check RESET the stream mid-transfer (`got 19 want 17`). The sequence is now taken once per frame. Regression: `TestWriteSequenceStableAcrossQueueFull` (1 KiB frames make queue-full reachable inside the 64 KiB window; pre-fix fails with the sequence-gap signature). The test also documents why queue-full requires small frames: with 32 KiB frames the window (2 frames) blocks long before the queue (16 slots).
+3. **P0 — `Stream.Read` released budget only when a block's tail drained** (session.go): the `recvCur` continuation branch still guarded `consumed` with `len(recvCur)==0` (a partial revert during the PR-07 fixup), stranding bytes whenever a block split across 3+ Reads. Regression: `TestReadPartialBlockReleasesBudget` asserts the per-stream ledger after every 4 KiB slice of a 32 KiB block (pre-fix: `held = 28672, want 24576` after 8 KiB).
+4. **P1 — `Scheduler.Ready` token shared by writer and producers**: audited; no lost-wakeup path exists because `Next()` re-signals while frames remain and `Enqueue` signals on accept — a stolen token either coincides with a full queue (writer not parked) or with a successful retry (signal re-issued). Regression pinned anyway: `TestSchedulerTokenSharedWriterAndProducers` (4 producers × 64 frames through the exact backpressure loop `Stream.Write` uses; all frames must drain).
+5. **Deadline stubs replaced with real `net.Conn` semantics**: standard `SetDeadline/SetReadDeadline/SetWriteDeadline(time.Time)` signatures (the old `SetDeadline` took a non-standard `interface{ IsZero() bool }`), blocked Read/Write select on per-direction resettable deadline channels and fail with `os.ErrDeadlineExceeded`. Regression: `TestStreamDeadlines`.
+
+Evidence: `go test -race -count=10 ./internal/mux` PASS (0 DATA RACE), full-repo `go test -race ./...` (11 packages) PASS, `go vet`/`gofmt` clean.
+
 ## v0.4 status (not a gate claim yet)
 
 - [x] PR-06A/06B protocol freeze + codec with golden vectors and fuzz targets

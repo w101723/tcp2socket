@@ -171,11 +171,22 @@ func (b *SessionBuffer) ReleaseStream(id uint32) {
 }
 
 // WaitBlocked parks until any Release fires (broadcast semantics via
-// channel replacement) or the caller gives up.
+// channel replacement) or the caller gives up. Marking woken here is the
+// protocol: without it Release sees woken==false and never broadcasts —
+// parked reservers would sleep until the session ends.
 func (b *SessionBuffer) WaitBlocked(id uint32) <-chan struct{} {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.woken = true // a waiter exists: the next Release must close b.wake
 	return b.wake
+}
+
+// heldFor reports the bytes currently reserved for stream id (test aid:
+// budget-accounting assertions).
+func (b *SessionBuffer) heldFor(id uint32) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.byStream[id]
 }
 
 func (b *SessionBuffer) Used() int64 {
