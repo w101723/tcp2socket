@@ -185,7 +185,7 @@ Resource observability: `TestProxyResourceBaseline` samples the proxy **subproce
 - [x] PR-05D doctor/version CLI + stable event logs
 - [x] Post-review concurrency closure (session timestamp race, heartbeat missed-counter race, WriteFrame short writes, event ordering contract)
 - [x] Post-review writer closure (frameWriter stops after terminal write error; enqueue/close race closed with the nil-iff-accepted contract)
-- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577), the concurrency-closure commit `684efaa` (run 39915280343), and the writer-closure commits `912e916`+follow-up (run 40048912760 exposed an enqueue invariant violation, fixed and re-verified)
+- [x] Full CI matrix green on gate commit `444dd46` (run 39909351577), the concurrency-closure commit `684efaa` (run 39915280343), and the writer-closure commits `912e916`/`95ef726` (run 40048912760 on `912e916` exposed an enqueue invariant violation; run 40049536711 green on `95ef726`)
 - [x] Fault injection summary (EOF, half frames, simultaneous close, stale PONG)
 
 Deferred to later stages per plan: v0.4 Mux design, v0.5 SOCKS listener/SSH transport, experimental PTY. The control layer remains decoupled from ordinary TCP forwarding.
