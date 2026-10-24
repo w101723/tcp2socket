@@ -108,8 +108,15 @@ func TestWriteSequenceStableAcrossQueueFull(t *testing.T) {
 		}
 		written <- nil
 	}()
-	time.Sleep(300 * time.Millisecond) // queue fills, retries begin (slow under -race)
-	close(release)                     // release: writer drains, retries succeed
+	// Wait for REAL saturation (queue at capacity), not a guessed sleep —
+	// but never hang: on a pathologically slow runner degrade to releasing
+	// early (the regression still fires whenever saturation is reached).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) &&
+		client.sched.StreamQueueLen(st.ID()) < schedulerQueueDepth {
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(release) // release: writer drains, retries succeed
 
 	// Server reader runs concurrently: the client's window only replenishes
 	// as the server consumes.
@@ -316,7 +323,11 @@ func TestWindowUpdateNeverLostBehindBulkData(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(150 * time.Millisecond) // queue saturated, writer parked
+	satDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(satDeadline) &&
+		client.sched.StreamQueueLen(st.ID()) < schedulerQueueDepth {
+		time.Sleep(10 * time.Millisecond)
+	} // queue saturated, writer parked
 
 	// Server sends one full window (64KiB); the client consumes it while
 	// its own data queue is full — the exact moment the pre-fix code

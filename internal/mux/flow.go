@@ -421,6 +421,14 @@ func (s *Scheduler) Close() {
 	s.signalReady()
 }
 
+// StreamQueueLen reports the pending frames for one stream (test hook:
+// lets regressions wait for a specific saturation state instead of sleeping).
+func (s *Scheduler) StreamQueueLen(id uint32) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.queues[id])
+}
+
 func (s *Scheduler) Closed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
