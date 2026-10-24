@@ -82,7 +82,7 @@ Evidence: `go test -race -count=3 ./internal/mux` PASS (zero DATA RACE reports);
 - [x] PR-06D flow control + fair scheduler
 - [x] PR-06E session assembly (handshake, single reader/writer, accept/open)
 - [x] PR-07 stress + fault injection with the four product closures above
-- [ ] CI green confirmation on `53a23bd`
+- [x] Full CI matrix green on `53a23bd` follow-up `91fe42c` (run 40062048232); the first PR-07 run (40061733769) failed on the 32-stream sweep under runner load and produced the accept-backlog retry fix recorded above
 - [ ] Gate decision: whether v0.4 closes here (library-complete mux) or also includes CLI wiring (explicit opt-in, no old-CLI breakage — a separate PR-08 decision)
 - [ ] Validation report gate checklist finalized
 
