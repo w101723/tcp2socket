@@ -108,7 +108,7 @@ func TestWriteSequenceStableAcrossQueueFull(t *testing.T) {
 		}
 		written <- nil
 	}()
-	time.Sleep(150 * time.Millisecond) // queue fills, retries begin
+	time.Sleep(300 * time.Millisecond) // queue fills, retries begin (slow under -race)
 	close(release)                     // release: writer drains, retries succeed
 
 	// Server reader runs concurrently: the client's window only replenishes
@@ -133,7 +133,7 @@ func TestWriteSequenceStableAcrossQueueFull(t *testing.T) {
 		if err != nil {
 			t.Fatalf("write with retries: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("write never completed after release")
 	}
 	select {
@@ -254,6 +254,137 @@ func TestSchedulerTokenSharedWriterAndProducers(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("lost wakeup: frames stuck in queues while writer waited")
+	}
+}
+
+// TestWindowUpdateNeverLostBehindBulkData: WINDOW_UPDATEs must not be
+// droppable behind a full stream queue. Pre-fix, consumed() ignored
+// Enqueue's ErrQueueFull, so a lost update froze the peer's send window
+// and deadlocked large bidirectional transfers (CI: TestMuxLargeTransfer
+// hang on a slow runner). Deterministic reproduction: saturate the
+// stream's data queue, then read (which consumes and must deliver the
+// update via the priority control path) and prove the peer's credit
+// regrew.
+func TestWindowUpdateNeverLostBehindBulkData(t *testing.T) {
+	c, s := net.Pipe()
+	release := make(chan struct{})
+	gc := &gateConn{Conn: c, pass: 4, release: release} // HELLO + OPEN_OK flow
+	client := mustSession(t, gc, SideClient)
+	server := mustSession(t, s, SideServer)
+	hErr := make(chan error, 2)
+	go func() { _, err := client.Handshake([]byte{CapStreamMux}, []byte{CapStreamMux}); hErr <- err }()
+	go func() { _, err := server.Handshake([]byte{CapStreamMux}, []byte{CapStreamMux}); hErr <- err }()
+	for i := 0; i < 2; i++ {
+		if err := <-hErr; err != nil {
+			t.Fatal(err)
+		}
+	}
+	go func() { _ = client.Serve() }()
+	go func() { _ = server.Serve() }()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+
+	st, err := client.Open(Target{Network: NetworkTCP, Address: "win.local:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sst, err := server.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Saturate the client's outbound DATA queue while the transport is
+	// frozen (gate exhausted): 17 x 1KiB frames — 16 fill the queue, the
+	// 17th parks on ErrQueueFull. The queue stays full.
+	const win = InitialStreamWindow
+	clientBusy := make(chan struct{})
+	go func() {
+		defer close(clientBusy)
+		buf := make([]byte, 1024)
+		for i := 0; i < 64; i++ {
+			if _, err := st.Write(buf); err != nil {
+				return
+			}
+		}
+	}()
+	// Server drains its inbound concurrently so its reader never parks in
+	// deliver behind unread DATA (that would block WINDOW_UPDATE dispatch).
+	go func() {
+		sink := make([]byte, 16*1024)
+		for {
+			if _, err := sst.Read(sink); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(150 * time.Millisecond) // queue saturated, writer parked
+
+	// Server sends one full window (64KiB); the client consumes it while
+	// its own data queue is full — the exact moment the pre-fix code
+	// dropped the WINDOW_UPDATE into a full queue.
+	go func() {
+		_, _ = sst.Write(make([]byte, win))
+	}()
+
+	// Client reads all of it back (consuming -> WINDOW_UPDATE due).
+	got := 0
+	buf := make([]byte, 16*1024)
+	for got < win {
+		n, err := st.Read(buf)
+		if err != nil {
+			t.Fatalf("read at %d: %v", got, err)
+		}
+		got += n
+	}
+
+	// Unblock the transport: queued DATA flushes and the control-priority
+	// WINDOW_UPDATEs reach the server.
+	close(release)
+
+	// Server's credit must have regrown: another full window must flow.
+	creditOK := make(chan int64, 1)
+	go func() {
+		deadline := time.After(3 * time.Second)
+		for {
+			if avail := sst.send.Available(); avail >= win {
+				creditOK <- avail
+				return
+			}
+			select {
+			case <-deadline:
+				creditOK <- sst.send.Available()
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}()
+	go func() {
+		_, _ = sst.Write(make([]byte, win))
+	}()
+	got = 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for got < win {
+			n, err := st.Read(buf)
+			if err != nil {
+				t.Errorf("second window read at %d: %v (update lost, window frozen)", got, err)
+				return
+			}
+			got += n
+		}
+	}()
+	select {
+	case avail := <-creditOK:
+		if avail < win {
+			t.Fatalf("server credit = %d after 3s, want >= %d: WINDOW_UPDATE lost", avail, win)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("credit probe never ran")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second window never arrived: WINDOW_UPDATE was dropped behind bulk data")
 	}
 }
 

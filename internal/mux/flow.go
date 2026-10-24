@@ -2,6 +2,7 @@ package mux
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -241,7 +242,7 @@ func (s *Scheduler) EnqueueControl(f Frame) error {
 		s.signalReady()
 		return nil
 	default:
-		return errors.New("mux control queue full")
+		return fmt.Errorf("%w: control queue", ErrQueueFull)
 	}
 }
 

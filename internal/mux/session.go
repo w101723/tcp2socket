@@ -680,12 +680,33 @@ func (st *Stream) consumed(n int) {
 	}
 	st.session.bufBudget.Release(st.id, n)
 	// The registry window (the single ledger) regrows; the WINDOW_UPDATE
-	// tells the peer its credit came back.
+	// tells the peer its credit came back. It rides the PRIORITY control
+	// queue, never the stream's data queue: a dropped update (Enqueue
+	// failing with ErrQueueFull behind bulk DATA) would freeze the peer's
+	// window and deadlock the transfer — exactly what TestMuxLargeTransfer
+	// hit on a slow runner. Wire format unchanged; this is scheduling only.
 	_ = st.session.reg.GrowReceiveWindow(st.id, int64(n))
-	_ = st.session.sched.Enqueue(Frame{
+	seq := st.nextWinSeq()
+	frame := Frame{
 		Type: TypeWindowUpdate, Epoch: st.session.epoch, StreamID: st.id,
-		Sequence: st.nextWinSeq(), Payload: WindowUpdatePayload(uint32(n)),
-	})
+		Sequence: seq, Payload: WindowUpdatePayload(uint32(n)),
+	}
+	for {
+		err := st.session.sched.EnqueueControl(frame)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrQueueFull) {
+			return // scheduler closed: the session is ending anyway
+		}
+		// control queue full (writer stalled): park until it drains; the
+		// update itself must never be dropped or the peer's window freezes
+		select {
+		case <-st.session.sched.Ready():
+		case <-st.dead:
+			return
+		}
+	}
 }
 
 func (st *Stream) recvError() error {
