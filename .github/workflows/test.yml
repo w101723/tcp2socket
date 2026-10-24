@@ -38,6 +38,9 @@ jobs:
         run: |
           go test ./internal/socks5 -run '^$' -fuzz '^FuzzReadRequest$' -fuzztime 5s -parallel 2
           go test ./internal/control -run '^$' -fuzz '^FuzzDecodeFrame$' -fuzztime 10s -parallel 2
+          go test ./internal/mux -run '^$' -fuzz '^FuzzDecodeFrame$' -fuzztime 10s -parallel 2
+          go test ./internal/mux -run '^$' -fuzz '^FuzzTargetDescriptor$' -fuzztime 5s -parallel 2
+          go test ./internal/mux -run '^$' -fuzz '^FuzzErrorPayload$' -fuzztime 5s -parallel 2
       - name: Build release targets
         shell: bash
         run: |
